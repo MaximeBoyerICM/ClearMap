@@ -602,6 +602,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
                           remove_previous_result=False,
                           extra_kwargs={'mask': mask, 'max_bin': max_bin}, **default_step_params)
     morphsnake = morphsnake.astype(bool)
+    morphsnake = postprocess_morphsnake(morphsnake)
     sink[valid_slicing] += morphsnake[valid_slicing]
 
     # adaptive
@@ -885,11 +886,7 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
 
 def deconvolve(source, binarized, sigma=10):
     from skimage.exposure import adjust_gamma
-    normalized = (source - np.min(source)) / (np.max(source) - np.min(source))
-
-    # alpha = 5
-    # exp_raised = np.exp(alpha * normalized) / np.log1p(alpha)
-    gamma_adjusted = adjust_gamma(normalized, 1.5)
+    gamma_adjusted = adjust_gamma(source, 1.5)
 
     background = np.zeros(gamma_adjusted.shape, dtype=float)
     background[:] = gamma_adjusted[:]
@@ -906,6 +903,13 @@ def deconvolve(source, binarized, sigma=10):
     deconvolved = source - np.minimum(source, convolved)
     deconvolved[binarized] = source[binarized]
     return deconvolved, bg_subtracted
+
+def postprocess_morphsnake(source):
+    from skimage.morphology import remove_small_objects, remove_small_holes
+    for z in range(source.shape[2]):
+        source[:, :, z] = remove_small_holes(source[:, :, z], area_threshold=20000)
+        source[:, :, z] = remove_small_objects(source[:, :, z], min_size=70)
+    return source
 
 
 def threshold_isodata(source):

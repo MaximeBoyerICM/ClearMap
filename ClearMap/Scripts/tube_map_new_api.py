@@ -23,8 +23,8 @@ def main(src_directory):
 
     # stitcher = StitchingProcessor(sample_manager)
     # stitcher.setup()
-    # registration_processor = RegistrationProcessor(sample_manager)
-    # registration_processor.setup()
+    registration_processor = RegistrationProcessor(sample_manager)
+    registration_processor.setup()
 
     # structure_name = 'hypothalamus'
     # stitched_asset = sample_manager.get('stitched', channel='vasc')
