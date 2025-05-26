@@ -21,6 +21,7 @@ import numpy as np
 import scipy.ndimage as ndi
 import skimage.filters as skif
 import skimage.exposure as ske
+from skimage.morphology import remove_small_holes
 
 import ClearMap.IO.IO as io
 from ClearMap.Utils.exceptions import MissingRequirementException
@@ -134,10 +135,10 @@ See :func:`binarize` for details."""
 
 
 default_binarization_processing_parameter = dict(
-    size_max=40,
-    size_min=5,
-    overlap=0,
-    axes=[2],
+    size_max=500, #40
+    size_min=500, #5
+    overlap=0, #0
+    axes=[1,2], #2
     optimization=True,
     optimization_fix='all',
     verbose=None,
@@ -570,7 +571,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             binarized = binary_status > 0
         else:
             binarized = sink[:]
-        deconvolved, background_subtracted = deconvolve(median, binarized[:], **parameter_deconvolution)
+        deconvolved = deconvolve(median, binarized[:], **parameter_deconvolution)
         del binarized
 
         if save:
@@ -593,17 +594,19 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             if verbose:
                 timer.print_elapsed_time('Deconvolution: binarization')
     else:
-        deconvolved, background_subtracted = median, median
+        deconvolved = median
 
     # active arrays: median, mask, deconvolved
 
     # morphACWE
-    morphsnake = run_step('morphsnake', background_subtracted, snk.morphological_chan_vese,
+    pre_snake = preprocess_snake(median)
+    snaked = run_step('morphsnake', pre_snake, snake,
                           remove_previous_result=False,
                           extra_kwargs={'mask': mask, 'max_bin': max_bin}, **default_step_params)
-    morphsnake = morphsnake.astype(bool)
-    morphsnake = postprocess_morphsnake(morphsnake)
-    sink[valid_slicing] += morphsnake[valid_slicing]
+    snaked = snaked.astype(bool)
+
+    post_snake = postprocess_snake(snaked)
+    sink[valid_slicing] += post_snake[valid_slicing]
 
     # adaptive
     parameter_adaptive = parameter.get('adaptive')
@@ -718,26 +721,6 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     del equalized, mask
     # active arrays: None
 
-    # fill holes
-    parameter_fill = parameter.get('fill')
-    if parameter_fill:
-        step_param, timer = print_params(parameter_fill, 'fill', prefix, verbose)
-
-        if binary_status is not None:
-            foreground = binary_status > 0
-            filled = ndi.morphology.binary_fill_holes(foreground)
-            binary_status[np.logical_and(filled, np.logical_not(foreground))] += BINARY_STATUS['Fill']
-            del foreground, filled
-        else:
-            filled = ndi.morphology.binary_fill_holes(sink[:])
-            sink[valid_slicing] += filled[valid_slicing]
-            del filled
-
-        if verbose:
-            timer.print_elapsed_time('Filling')
-
-    if binary_status is not None:
-        sink[valid_slicing] = binary_status[valid_slicing] > 0
 
     # smooth binary
     if parameter.get('smooth'):  # WARNING: otherwise removes sink if no smoothing
@@ -827,7 +810,8 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
         save = False
 
     if run_binary_filling:
-        bf.fill(fill_source, sink=sink, processes=processes, verbose=verbose)
+        filled = twoD_filling(fill_source)
+        bf.fill(filled, sink=sink, processes=processes, verbose=verbose)
         if parameter_smooth and not save:
             io.delete_file(tmp_f_path)
 
@@ -883,17 +867,29 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
     clipped = np.asarray(clipped, dtype=dtype)
     return clipped, mask, high, low
 
-
-def deconvolve(source, binarized, sigma=10):
+def preprocess_snake(source):
     from skimage.exposure import adjust_gamma
     gamma_adjusted = adjust_gamma(source, 1.5)
-
-    background = np.zeros(gamma_adjusted.shape, dtype=float)
+    background = np.zeros(source.shape, dtype=float)
     background[:] = gamma_adjusted[:]
     for z in range(background.shape[2]):
         background[:, :, z] = ndi.gaussian_filter(background[:, :, z], sigma=20)
     bg_subtracted = gamma_adjusted - np.minimum(gamma_adjusted, background)
+    return bg_subtracted
 
+def snake(source):
+    snaked = snk.morphological_chan_vese(source)
+    return snaked
+
+def postprocess_snake(source):
+    from skimage.morphology import remove_small_objects
+    post_snake = np.zeros(source.shape, dtype=bool)
+    post_snake[:] = source[:]
+    for z in range(post_snake.shape[0]):
+        post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=70)
+    return post_snake
+
+def deconvolve(source, binarized, sigma=10):
     convolved = np.zeros(source.shape, dtype=float)
     convolved[binarized] = source[binarized]
 
@@ -902,14 +898,7 @@ def deconvolve(source, binarized, sigma=10):
 
     deconvolved = source - np.minimum(source, convolved)
     deconvolved[binarized] = source[binarized]
-    return deconvolved, bg_subtracted
-
-def postprocess_morphsnake(source):
-    from skimage.morphology import remove_small_objects, remove_small_holes
-    for z in range(source.shape[2]):
-        source[:, :, z] = remove_small_holes(source[:, :, z], area_threshold=20000)
-        source[:, :, z] = remove_small_objects(source[:, :, z], min_size=70)
-    return source
+    return deconvolved
 
 
 def threshold_isodata(source):
@@ -946,6 +935,21 @@ def equalize(source, percentile=(0.5, 0.95), max_value=1.5, selem=(200, 200, 5),
 def tubify(source, sigma=1.0, gamma12=1.0, gamma23=1.0, alpha=0.25):
     return hes.lambda123(source=source, sink=None, sigma=sigma, gamma12=gamma12, gamma23=gamma23, alpha=alpha)
 
+def twoD_filling(source):
+    filled = np.zeros(source.shape, dtype=bool)
+    step = 4
+    for z in range(0, filled.shape[0], step):
+        filled[z:z+step, :, :] = remove_small_holes(source[z:z+step, :, :], area_threshold=5e5, connectivity=1)
+    remainder = filled.shape[0] % step
+    if remainder != 0:
+        filled[-remainder:, :, :] = remove_small_holes(source[-remainder:, :, :], area_threshold=5e5)
+
+    for x in range(0, filled.shape[2], step):
+        filled[:, :, x:x+step] = remove_small_holes(filled[:, :, x:x+step], area_threshold=5e5, connectivity=1)
+    remainder = filled.shape[2] % step
+    if remainder != 0:
+        filled[:, :, -remainder:] = remove_small_holes(filled[:, :, -remainder:], area_threshold=5e5)
+    return filled
 
 ###############################################################################
 # ## Helper
