@@ -253,30 +253,31 @@ class Tag:
         if not tag.endswith(TAG_END):
             raise ValueError(f'Expecting the tag to end with {TAG_END} found {tag[-len(TAG_END):]}!')
 
-        body = tag[len(TAG_START):-len(TAG_END)]
-        if not body:  # Use default values
-            self.name = self.width = None
-            self.ttype = TAG_INT
+        tag = tag[len(TAG_START):-len(TAG_END)]
+        if not tag:
+            self.__init__()
             return
 
-        parts = body.split(TAG_SEPARATOR)
-        if len(parts) > 3:
-            raise ValueError(f'Found {len(parts)} > 3 tag attributes !')
-
         tag_attributes = {
-            'name': parts[0] or None,
-            'ttype': TAG_INT,
+            'name': None,
+            'ttype': None,
             'width': None
         }
 
-        if len(parts) == 3:
-            tag_attributes['ttype'] = parts[1]
-            tag_attributes['width'] = int(parts[2])
-        elif len(parts) == 2:
+        values = tag.split(TAG_SEPARATOR)
+        if len(values) > 3:
+            raise ValueError(f'Found {len(values)} > 3 tag attributes !')
+        elif len(values) == 3:
+            tag_attributes['name'] = values[0]
+            tag_attributes['ttype'] = values[1]
+            tag_attributes['width'] = int(values[2])
+        elif len(values) == 2:
+            tag_attributes['name'] = values[0]
+            tmp = values[1]
             try:
-                tag_attributes['width'] = int(parts[1])
+                tag_attributes['width'] = int(tmp)
             except ValueError:
-                tag_attributes['ttype'] = parts[1]
+                tag_attributes['ttype'] = tmp
 
         for k, v in tag_attributes.items():
             if v is not None and not v:
@@ -304,21 +305,6 @@ class Expression:
                 pattern = []  # FIXME: no plural in pattern what list is it? it seems tags
             self.pattern = pattern
             self.tags = [p for p in pattern if isinstance(p, Tag) and not p.reference]
-
-    @staticmethod
-    def is_expression(expr) -> bool:
-        """
-        Return True if *expr* contains at least one <…> tag fragment.
-        Accepts str, pathlib.Path or Expression instances.
-        """
-        if isinstance(expr, Expression):
-            # if someone passes an already-built object, honour its own parse result
-            return bool(expr.tags)
-
-        if isinstance(expr, (str, Path)):
-            return Expression.tag_regexp.search(str(expr)) is not None
-
-        raise TypeError(f"is_expression() expects str, Path or Expression; got {type(expr).__name__}")
 
     def tag(self):  # FIXME: confusing name. Does this "tag" the expression?
         e = ''

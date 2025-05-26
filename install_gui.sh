@@ -190,8 +190,7 @@ pip_mode="True"
 if [[ $USE_TORCH == "True" ]]; then
     green "Installing pytorch through conda may be restricted due to the license of the nvidia channel.
       If you prefer installing pytorch through pip, please select 'pip' below."
-    read -r -p "PyTorch can be installed using either conda or pip. \
-    Do you want to install PyTorch with conda (type y for conda, press Enter or n for pip)?" answer
+    read -r -p "Do you wish to install pytorch through conda (y/[n])?" answer
     case "$answer" in
         [yY][eE][sS]|[yY])
             pip_mode="False";

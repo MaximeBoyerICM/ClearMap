@@ -108,7 +108,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from PyQt5.QtWidgets import QApplication, QLabel, QButtonGroup, QFrame, QRadioButton, QHBoxLayout
+from PyQt5.QtWidgets import QApplication, QLabel, QButtonGroup
 import pyqtgraph as pg
 from natsort import natsorted
 from pyqtgraph import PlotWidget
@@ -135,8 +135,7 @@ from ClearMap.gui.dialogs import option_dialog
 from ClearMap.gui.interfaces import GenericTab, PostProcessingTab, PreProcessingTab, BatchTab, PipelineTab
 from ClearMap.gui.widgets import (PatternDialog, DataFrameWidget, LandmarksSelectorDialog,
                                   CheckableListWidget, FileDropListWidget, ExtendableTabWidget)
-from ClearMap.gui.gui_utils import format_long_nb, np_to_qpixmap, replace_widget, unique_connect, get_widget, \
-    create_clearmap_widget
+from ClearMap.gui.gui_utils import format_long_nb, np_to_qpixmap, replace_widget, unique_connect, get_widget
 from ClearMap.gui.params import (VesselParams, SampleParameters, StitchingParams,
                                  CellMapParams, GroupAnalysisParams, BatchProcessingParams, RegistrationParams,
                                  TractMapParams, ColocalizationParams)
@@ -171,7 +170,7 @@ class SampleInfoTab(GenericTab):
         self.with_add_btn = True
         self.names_map = []
         self.detached = False  # WARNING: To avoid calling update when channels are setup by
-                               #   the wizard
+                               #   the wizzard
 
     def _set_params(self):
         self.params = SampleParameters(self.ui, self.main_window.src_folder)
@@ -202,7 +201,7 @@ class SampleInfoTab(GenericTab):
 
         self.ui.srcFolderBtn.clicked.connect(self.main_window.prompt_experiment_folder)
 
-        self.ui.launchPatternWizardPushButton.clicked.connect(self.launch_pattern_wizard)
+        self.ui.launchPatternWizzardPushButton.clicked.connect(self.launch_pattern_wizard)
         self.ui.updateWorkspacePushButton.clicked.connect(self.update_workspace)
 
         self.ui.removeCurrentChannelToolButton.clicked.connect(self.remove_current_channel)
@@ -1295,7 +1294,7 @@ class CellCounterTab(PostProcessingTab):
         self.wrap_plot(self.cell_detectors[channel].plot_cells_3d_scatter_w_atlas_colors, raw=raw)
 
     def __filter_cells(self, channel, is_last_step=True):
-        if self.sample_manager.get('cells', channel=channel, asset_sub_type='raw').exists:
+        if self.sample_manager.get('cells', postfix='raw').exists:
             detector = self.cell_detectors[channel]
             self.wrap_step('Filtering cells', detector.filter_cells, n_steps=2 + (1 - is_last_step),
                            abort_func=detector.stop_process, close_when_done=False)
@@ -2080,18 +2079,15 @@ class GroupAnalysisProcessor:
         link_dataviewers_cursors(dvs)
         return dvs
 
-    def compute_p_vals(self, selected_comparisons, groups, wrapping_func, channels,
-                       advanced=False, density_files_suffix=''):
+    def compute_p_vals(self, selected_comparisons, groups, wrapping_func, channels, advanced=False):
         for pair in selected_comparisons:
             gp1_name, gp2_name = pair
             gp1, gp2 = [groups[gp_name] for gp_name in pair]
             for channel in channels:
-                _ = density_files_are_comparable(self.results_folder, gp1, gp2, channel,
-                                                 density_file_suffix=density_files_suffix)
+                _ = density_files_are_comparable(self.results_folder, gp1, gp2, channel)
             check_ids_are_unique(gp1, gp2)
             # compare_groups is automatically for each channel (loads the first sample to find the channels)
-            wrapping_func(compare_groups, self.results_folder, gp1_name, gp2_name, gp1, gp2,
-                          advanced=advanced, density_files_suffix=density_files_suffix)
+            wrapping_func(compare_groups, self.results_folder, gp1_name, gp2_name, gp1, gp2, advanced=advanced)
             self.progress_watcher.increment_main_progress()
 
     def run_plots(self, plot_function, selected_comparisons, plot_kw_args):
@@ -2129,11 +2125,7 @@ class GroupAnalysisTab(BatchTab):
         super().__init__(main_window, tab_idx)
         self.processor = GroupAnalysisProcessor(self.main_window.progress_watcher)
 
-        self.advanced_controls_names = [
-            'computeSdAndEffectSizeCheckBox',
-            'densitySuffixTextFilterLabel',
-            'densitySuffixTextFilterLineEdit'
-        ]
+        self.advanced_controls_names = ['computeSdAndEffectSizeCheckBox']
 
     def _set_channels_names(self):
         pass  # TODO: check if required
@@ -2207,8 +2199,7 @@ class GroupAnalysisTab(BatchTab):
             self.processor.compute_p_vals(self.params.selected_comparisons, self.params.groups,
                                           self.main_window.wrap_in_thread,
                                           channels=self.get_analysable_channels(),
-                                          advanced=self.params.compute_sd_and_effect_size,
-                                          density_files_suffix=self.params.density_suffix)
+                                          advanced=self.params.compute_sd_and_effect_size)
         except GroupStatsError as err:
             self.main_window.popup(str(err), base_msg='Cannot proceed with analysis')
         self.main_window.signal_process_finished()
