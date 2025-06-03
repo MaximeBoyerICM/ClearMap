@@ -20,8 +20,8 @@ import tempfile as tmpf
 import numpy as np
 import scipy.ndimage as ndi
 import skimage.filters as skif
-import skimage.exposure as ske
-from skimage.morphology import remove_small_holes
+from skimage.morphology import remove_small_objects, remove_small_holes
+from skimage.exposure import adjust_gamma
 
 import ClearMap.IO.IO as io
 from ClearMap.Utils.exceptions import MissingRequirementException
@@ -810,7 +810,7 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
         save = False
 
     if run_binary_filling:
-        filled = twoD_filling(fill_source)
+        filled = slice_filling(fill_source)
         bf.fill(filled, sink=sink, processes=processes, verbose=verbose)
         if parameter_smooth and not save:
             io.delete_file(tmp_f_path)
@@ -868,25 +868,26 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
     return clipped, mask, high, low
 
 def preprocess_snake(source):
-    from skimage.exposure import adjust_gamma
     gamma_adjusted = adjust_gamma(source, 1.5)
     background = np.zeros(source.shape, dtype=float)
     background[:] = gamma_adjusted[:]
+
     for z in range(background.shape[2]):
         background[:, :, z] = ndi.gaussian_filter(background[:, :, z], sigma=20)
     bg_subtracted = gamma_adjusted - np.minimum(gamma_adjusted, background)
+
     return bg_subtracted
 
 def snake(source):
-    snaked = snk.morphological_chan_vese(source)
-    return snaked
+    return snk.morphological_chan_vese(source)
 
 def postprocess_snake(source):
-    from skimage.morphology import remove_small_objects
     post_snake = np.zeros(source.shape, dtype=bool)
     post_snake[:] = source[:]
+
     for z in range(post_snake.shape[0]):
         post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=70)
+
     return post_snake
 
 def deconvolve(source, binarized, sigma=10):
@@ -935,7 +936,7 @@ def equalize(source, percentile=(0.5, 0.95), max_value=1.5, selem=(200, 200, 5),
 def tubify(source, sigma=1.0, gamma12=1.0, gamma23=1.0, alpha=0.25):
     return hes.lambda123(source=source, sink=None, sigma=sigma, gamma12=gamma12, gamma23=gamma23, alpha=alpha)
 
-def twoD_filling(source):
+def slice_filling(source):
     filled = np.zeros(source.shape, dtype=bool)
     step = 4
     for z in range(0, filled.shape[0], step):
