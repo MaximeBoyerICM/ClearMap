@@ -938,19 +938,26 @@ def tubify(source, sigma=1.0, gamma12=1.0, gamma23=1.0, alpha=0.25):
 
 def slice_filling(source):
     filled = np.zeros(source.shape, dtype=bool)
-    step = 4
-    for z in range(0, filled.shape[0], step):
-        filled[z:z+step, :, :] = remove_small_holes(source[z:z+step, :, :], area_threshold=5e5, connectivity=1)
-    remainder = filled.shape[0] % step
-    if remainder != 0:
-        filled[-remainder:, :, :] = remove_small_holes(source[-remainder:, :, :], area_threshold=5e5)
+    filled[:] = source[:]
 
-    for x in range(0, filled.shape[2], step):
-        filled[:, :, x:x+step] = remove_small_holes(filled[:, :, x:x+step], area_threshold=5e5, connectivity=1)
-    remainder = filled.shape[2] % step
-    if remainder != 0:
-        filled[:, :, -remainder:] = remove_small_holes(filled[:, :, -remainder:], area_threshold=5e5)
+    step = 4
+    for axis in [0, 1]:
+        size_slice = source.shape[(axis + 1) % 3] * source.shape[(axis + 2) % 3]
+        area_threshold = size_slice // 3
+        filled = apply_remove_small_holes_along_axis(filled, axis=axis, step=step, area_threshold=area_threshold)
+
     return filled
+
+def apply_remove_small_holes_along_axis(arr, axis, step, area_threshold):
+    slicer = [slice(None)] * arr.ndim
+    size = arr.shape[axis]
+
+    for start in range(0, size, step):
+        end = min(start + step, size)
+        slicer[axis] = slice(start, end)
+        slc = tuple(slicer)
+        arr[slc] = remove_small_holes(arr[slc], area_threshold=area_threshold, connectivity=1)
+    return arr
 
 ###############################################################################
 # ## Helper
