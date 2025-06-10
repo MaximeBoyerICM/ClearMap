@@ -44,6 +44,7 @@ import natsort
 import numpy as np
 
 from ClearMap.Analysis.Graphs.GraphGt import Graph
+from ClearMap.Analysis.Graphs.GraphGt import load as load_graph
 from ClearMap.IO import IO as clearmap_io
 from ClearMap.IO import FileUtils as file_utils
 from ClearMap.IO.assets_constants import CONTENT_TYPE_TO_PIPELINE
@@ -191,7 +192,7 @@ class Asset:
             status = 'debug'  # Must be a string to build the path
         return status
 
-    def variant(self, sample_id=None, extension=None, version=None, expression=None):
+    def variant(self, sample_id=None, extension=None, version=None, expression=None, sub_type=None):
         """
         Returns a variant of the asset with the given sample_id, extension and version.
 
@@ -221,7 +222,15 @@ class Asset:
                 expression = Expression(str(self.with_extension(extension))) if self.is_expression else None
             else:
                 expression = self.expression
-        type_spec = deepcopy(self.type_spec)
+        if sub_type:
+            if isinstance(sub_type, str):
+                type_spec = self.type_spec.sub_types[sub_type]
+            elif isinstance(sub_type, TypeSpec):
+                type_spec = sub_type
+            else:
+                raise ValueError(f'sub_type must be a string or a TypeSpec, got "{type(sub_type)}".')
+        else:
+            type_spec = deepcopy(self.type_spec)
         if not self.is_expression and extension:
             type_spec.extensions = list(dict.fromkeys([extension] + self.type_spec.extensions))
         # WARNING: long list, should use keyword arguments
@@ -462,7 +471,9 @@ class Asset:
         """
         return bool(file_utils.find_existing_extension(self.path, self.type_spec.extensions))
 
-    def delete(self):  # FIXME: add missing_ok -> then not existing_path but just path
+    def delete(self, missing_ok=False):
+        if missing_ok and not self.exists:
+            return
         os.remove(self.existing_path)
 
     @property
@@ -516,7 +527,10 @@ class Asset:
         return self.path.stat().st_size
 
     def read(self, *args, **kwargs):
-        return clearmap_io.read(self.existing_path, *args, **kwargs)
+        if self.type_spec.extensions[0] == '.gt':
+            return load_graph(self.existing_path, *args, **kwargs)
+        else:
+            return clearmap_io.read(self.existing_path, *args, **kwargs)
 
     def write(self, data, *args, **kwargs):
         if isinstance(data, Graph):
@@ -584,6 +598,18 @@ class Asset:
         source = self.as_source()
         self.status_manager.status = status
         return self.write(np.asarray(source[slicing], order='F'))
+
+    def all_sub_types(self):
+        """
+        Returns all sub types of the asset.
+
+        Returns
+        -------
+        list of str
+            The sub types of the asset.
+        """
+        all_assets = [self] + [self.variant(sub_type=sub_type) for sub_type in self.type_spec.sub_types]
+        return all_assets
 
 
 class ExpressionAsset(Asset):
@@ -675,7 +701,9 @@ class ExpressionAsset(Asset):
         return file_utils.find_existing_extension(self.file_list[0],
                                                   self.type_spec.extensions)
 
-    def delete(self):
+    def delete(self, missing_ok=False):
+        if missing_ok and not self.exists:
+            return
         for f in self.file_list:
             os.remove(f)
 

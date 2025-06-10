@@ -7,6 +7,35 @@ if [ -z "$1" ]; then
     set -- -f ClearMap3.yml
 fi
 
+
+function red(){  #  From https://stackoverflow.com/a/57096493
+    echo -e "\x1B[31m $1 \x1B[0m"
+    if [ -n "${2}" ]; then
+        echo -e "\x1B[31m $($2) \x1B[0m"
+    fi
+}
+function green(){
+    echo -e "\x1B[32m $1 \x1B[0m"
+    if [ -n "${2}" ]; then
+        echo -e "\x1B[32m $($2) \x1B[0m"
+    fi
+}
+
+function yellow(){
+    echo -e "\x1B[33m $1 \x1B[0m"
+    if [ -n "${2}" ]; then
+      echo -e "\x1B[33m $($2) \x1B[0m"
+    fi
+}
+
+function green_n(){  # FIXME: parametrise above instead
+    echo -n -e "\x1B[32m $1 \x1B[0m"
+    if [ -n "${2}" ]; then
+        echo -n -e "\x1B[32m $($2) \x1B[0m"
+    fi
+}
+
+
 usage() {
   cat << EOF >&2
   Usage: $PROG_NAME [-h] [-f <env-file-path>] [-s]
@@ -57,35 +86,6 @@ if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
 else
     yellow "Not a git repository. Skipping commit number save."
 fi
-
-
-
-function red(){  #  From https://stackoverflow.com/a/57096493
-    echo -e "\x1B[31m $1 \x1B[0m"
-    if [ -n "${2}" ]; then
-        echo -e "\x1B[31m $($2) \x1B[0m"
-    fi
-}
-function green(){
-    echo -e "\x1B[32m $1 \x1B[0m"
-    if [ -n "${2}" ]; then
-        echo -e "\x1B[32m $($2) \x1B[0m"
-    fi
-}
-
-function yellow(){
-    echo -e "\x1B[33m $1 \x1B[0m"
-    if [ -n "${2}" ]; then
-      echo -e "\x1B[33m $($2) \x1B[0m"
-    fi
-}
-
-function green_n(){  # FIXME: parametrise above instead
-    echo -n -e "\x1B[32m $1 \x1B[0m"
-    if [ -n "${2}" ]; then
-        echo -n -e "\x1B[32m $($2) \x1B[0m"
-    fi
-}
 
 ########################################################################################################################
 
@@ -187,20 +187,20 @@ else
 fi
 
 pip_mode="True"
-if [[ $USE_TORCH == "True" ]]; then
-    green "Installing pytorch through conda may be restricted due to the license of the nvidia channel.
-      If you prefer installing pytorch through pip, please select 'pip' below."
-    read -r -p "PyTorch can be installed using either conda or pip. \
-    Do you want to install PyTorch with conda (type y for conda, press Enter or n for pip)?" answer
-    case "$answer" in
-        [yY][eE][sS]|[yY])
-            pip_mode="False";
-            ;;
-        *)
-            pip_mode="True";
-            ;;
-    esac
-fi
+#if [[ $USE_TORCH == "True" ]]; then
+#    green "Installing pytorch through conda may be restricted due to the license of the nvidia channel.
+#      If you prefer installing pytorch through pip, please select 'pip' below."
+#    read -r -p "PyTorch can be installed using either conda or pip. \
+#    Do you want to install PyTorch with conda (type y for conda, press Enter or n for pip)?" answer
+#    case "$answer" in
+#        [yY][eE][sS]|[yY])
+#            pip_mode="False";
+#            ;;
+#        *)
+#            pip_mode="True";
+#            ;;
+#    esac
+#fi
 
 echo "  Getting env name"
 ENV_NAME=$(python -c "import os; from ClearMap.Utils.install_utils import EnvFileManager; \
@@ -293,8 +293,8 @@ green "Done"
 
 # CONFIG
 clearmap_install_path=$(python -c "from ClearMap.config.update_config import CLEARMAP_DIR; print(CLEARMAP_DIR)")
-if [ "$clearmap_install_path" == "" ];then
-    echo "ERROR: could not get ClearMap install path"
+if [ "$clearmap_install_path" == "" ]; then
+    red "ERROR: could not get ClearMap install path"
     exit 1
 fi
 echo "ClearMap installed at \"$clearmap_install_path\""

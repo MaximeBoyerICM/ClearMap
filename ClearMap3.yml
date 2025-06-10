@@ -57,6 +57,9 @@ dependencies:
   - pip
   - pip:
     - itk-elastix
+#    - --extra-index-url https://download.pytorch.org/whl/{cuda_suffix}')
+#    - torch
+#    - torchvision
 variables:
   PYTHONNOUSERSITE: 1
 #  TMPDIR: /data/tmp

@@ -132,7 +132,12 @@ class Graph(grp.AnnotatedGraph):
         self._base.remove_vertex(vertex)
 
     def vertex_property(self, name, vertex=None, as_array=True):
-        v_prop = self._base.vertex_properties[name]
+        try:
+            v_prop = self._base.vertex_properties[name]
+        except KeyError as err:
+            raise KeyError(f'Graph has no vertex property with name {name}!'
+                           f'Possible vertex properties are: {self.vertex_properties};'
+                           f'{err}')
         if vertex is not None:
             return v_prop[self.vertex(vertex)]
         else:
@@ -603,7 +608,11 @@ class Graph(grp.AnnotatedGraph):
         if name in self.edge_properties:
             self.remove_edge_property(name)
 
-    def resize_edge_geometry(self):
+    def prune_edge_geometry(self):
+        """
+        Remove the unused edge geometries from the graph.
+        This computes the new indices and remaps the edge geometry properties to the new indices.
+        """
         if not self.has_edge_geometry() or self.edge_geometry_type != 'graph':
             return
 
@@ -827,7 +836,7 @@ class Graph(grp.AnnotatedGraph):
         else:
             g = gt.Graph(gv, prune=True)
             g = Graph(base=g)
-            g.resize_edge_geometry()
+            g.prune_edge_geometry()
             return g
 
     def view(self, vertex_filter=None, edge_filter=None):
