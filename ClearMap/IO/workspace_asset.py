@@ -43,8 +43,8 @@ from pathlib import Path
 import natsort
 import numpy as np
 
-from ClearMap.Analysis.Graphs.GraphGt import Graph
-from ClearMap.Analysis.Graphs.GraphGt import load as load_graph
+from ClearMap.Analysis.graphs.graph_gt import Graph
+from ClearMap.Analysis.graphs.graph_gt import load as load_graph
 from ClearMap.IO import IO as clearmap_io
 from ClearMap.IO import FileUtils as file_utils
 from ClearMap.IO.assets_constants import CONTENT_TYPE_TO_PIPELINE
@@ -718,6 +718,13 @@ class ExpressionAsset(Asset):
             True if all tiles exist, False otherwise.
         """
         return self.all_tiles_exist
+
+    @property
+    def size(self):
+        total_size = 0
+        for f in self.file_list:
+            total_size += Path(f).stat().st_size
+        return total_size
 
     @property
     def all_tiles_exist(self):  # TODO: try with all known extensions # REFACTOR: rename more generic (all images)
