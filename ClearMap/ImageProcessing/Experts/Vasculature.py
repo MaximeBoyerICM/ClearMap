@@ -527,9 +527,6 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         logged = np.log1p(alpha * normalized) / np.log1p(alpha)
         return logged
 
-    if log_instead_of_clip:
-        logged = run_step('log', source, norm_log, **default_step_params)
-
     # clipping
     parameter_clip = parameter.get('clip')
     if parameter_clip:
@@ -538,13 +535,10 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         parameter_clip.update(norm=max_bin, dtype=DTYPE)
 
         save = parameter_clip.pop('save', None)
-
         if log_instead_of_clip:
-            alpha = 10
-            parameter_clip['clip_range'][0] /= np.max(source)
-            parameter_clip['clip_range'][0] = np.log1p(alpha * parameter_clip['clip_range'][0]) / np.log1p(alpha)
             parameter_clip['clip_range'][1] = 1e5
-            clipped, mask, high, low = clip(logged, **parameter_clip)
+            clipped, mask, high, low = clip(source, **parameter_clip)
+            clipped = run_step('log', clipped, norm_log, **default_step_params)
         else:
             clipped, mask, high, low = clip(source, **parameter_clip)
         not_low = np.logical_not(low)
@@ -580,7 +574,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     # active arrays: median, mask
     if only_snake:
         # morphACWE
-        pre_snake = preprocess_snake(median)
+        pre_snake = preprocess_snake(median, log_instead_of_clip)
         snaked = run_step('morphsnake', pre_snake, snake,
                           remove_previous_result=False,
                           extra_kwargs={'mask': mask, 'max_bin': max_bin}, **default_step_params)
@@ -887,13 +881,17 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
     clipped = np.asarray(clipped, dtype=dtype)
     return clipped, mask, high, low
 
-def preprocess_snake(source):
-    gamma_adjusted = adjust_gamma(source, 1.5)
+def preprocess_snake(source, log_instead_of_clip):
+    if not log_instead_of_clip:
+        gamma_adjusted = adjust_gamma(source, 1.5)
+    else:
+        gamma_adjusted = source
     background = np.zeros(source.shape, dtype=float)
     background[:] = gamma_adjusted[:]
 
     for z in range(background.shape[2]):
         background[:, :, z] = ndi.gaussian_filter(background[:, :, z], sigma=20)
+
     bg_subtracted = gamma_adjusted - np.minimum(gamma_adjusted, background)
 
     return bg_subtracted
