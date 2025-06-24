@@ -937,8 +937,7 @@ def tubify(source, sigma=1.0, gamma12=1.0, gamma23=1.0, alpha=0.25):
     return hes.lambda123(source=source, sink=None, sigma=sigma, gamma12=gamma12, gamma23=gamma23, alpha=alpha)
 
 def slice_filling(source):
-    filled = np.zeros(source.shape, dtype=bool)
-    filled[:] = source[:]
+    filled = source
 
     step = 4
     for axis in [0, 1]:
