@@ -524,7 +524,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         normalized = (source - np.min(source)) / (np.max(source) - np.min(source))
         # normalized[:] = rescale_intensity(source, in_range=(np.percentile(source, 0), np.percentile(source, 99.5)), out_range=(0, 1))
         alpha = 10
-        logged = np.log1p(alpha * normalized) / np.log1p(normalized)
+        logged = np.log1p(alpha * normalized) / np.log1p(alpha)
         return logged
 
     if log_instead_of_clip:
@@ -541,7 +541,8 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
 
         if log_instead_of_clip:
             alpha = 10
-            parameter_clip['clip_range'][0] = np.log1p(alpha * parameter_clip['clip_range'][0]) / np.log1p(parameter_clip['clip_range'][0])
+            parameter_clip['clip_range'][0] /= np.max(source)
+            parameter_clip['clip_range'][0] = np.log1p(alpha * parameter_clip['clip_range'][0]) / np.log1p(alpha)
             parameter_clip['clip_range'][1] = 1e5
             clipped, mask, high, low = clip(logged, **parameter_clip)
         else:
