@@ -572,17 +572,18 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
                       extra_kwargs={'max_bin': max_bin, 'mask': not_low}, **default_step_params)
     del not_low
     # active arrays: median, mask
-    if only_snake:
-        # morphACWE
-        pre_snake = preprocess_snake(median, log_instead_of_clip)
-        snaked = run_step('morphsnake', pre_snake, snake,
-                          remove_previous_result=False,
-                          extra_kwargs={'mask': mask, 'max_bin': max_bin}, **default_step_params)
-        snaked = snaked.astype(bool)
 
-        post_snake = postprocess_snake(snaked)
-        sink[valid_slicing] += post_snake[valid_slicing]
-    else:
+    # morphACWE
+    pre_snake = preprocess_snake(median, log_instead_of_clip)
+    snaked = run_step('morphsnake', pre_snake, snake,
+                      remove_previous_result=False,
+                      extra_kwargs={'mask': mask, 'max_bin': max_bin}, **default_step_params)
+    snaked = snaked.astype(bool)
+
+    post_snake = postprocess_snake(snaked)
+    sink[valid_slicing] += post_snake[valid_slicing]
+
+    if not only_snake:
         # pseudo deconvolution
         parameter_deconvolution = parameter.get('deconvolve')
         if parameter_deconvolution:
