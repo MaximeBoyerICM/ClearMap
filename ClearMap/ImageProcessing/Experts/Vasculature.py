@@ -520,13 +520,6 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     default_step_params = {'parameter': parameter, 'steps_to_measure': {}, 'prefix': prefix,
                            'base_slicing': base_slicing, 'valid_slicing': valid_slicing}
 
-    def norm_log(source):
-        normalized = (source - np.min(source)) / (np.max(source) - np.min(source))
-        # normalized[:] = rescale_intensity(source, in_range=(np.percentile(source, 0), np.percentile(source, 99.5)), out_range=(0, 1))
-        alpha = 10
-        logged = np.log1p(alpha * normalized) / np.log1p(alpha)
-        return logged
-
     # clipping
     parameter_clip = parameter.get('clip')
     if parameter_clip:
@@ -536,22 +529,22 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
 
         save = parameter_clip.pop('save', None)
         if log_instead_of_clip:
-            parameter_clip['clip_range'][1] = 1e5
-            clipped, mask, high, low = clip(source, **parameter_clip)
-            clipped = run_step('log', clipped, norm_log, **default_step_params)
+            _, mask, high, low = clip(source, **parameter_clip)
+            # clipped = run_step('log', source, norm_log, **default_step_params)
+            clipped = norm_log(source, **parameter_clip)
         else:
             clipped, mask, high, low = clip(source, **parameter_clip)
         not_low = np.logical_not(low)
 
         if save:
             save = io.as_source(save)
-            print("DEBUG:", source.info(), source.slicing)
+            print("DEBUG:", source.info(), source.slicing, base_slicing, valid_slicing)
             save[base_slicing] = clipped[valid_slicing]
 
-        if binary_status is not None:
-            binary_status[high[valid_slicing]] += BINARY_STATUS['High']
-        else:
-            sink[valid_slicing] = high[valid_slicing]
+        # if binary_status is not None:
+        #     binary_status[high[valid_slicing]] += BINARY_STATUS['High']
+        # else:
+        #     sink[valid_slicing] = high[valid_slicing]
 
         del high, low
 
@@ -570,19 +563,24 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     # median filter
     median = run_step('median', corrected, rnk.median, remove_previous_result=True,
                       extra_kwargs={'max_bin': max_bin, 'mask': not_low}, **default_step_params)
-    del not_low
+
     # active arrays: median, mask
 
     # morphACWE
     pre_snake = preprocess_snake(median, log_instead_of_clip)
-    snaked = run_step('morphsnake', pre_snake, snake,
-                      remove_previous_result=False,
-                      extra_kwargs={'mask': mask, 'max_bin': max_bin}, **default_step_params)
-    snaked = snaked.astype(bool)
+    snaked = snk.morphological_chan_vese(image=pre_snake.astype(np.uint16), mask=mask.astype(np.uint8), shape=np.array(pre_snake.shape, dtype=np.intp))
 
-    post_snake = postprocess_snake(snaked)
-    sink[valid_slicing] += post_snake[valid_slicing]
+    if not only_snake:
+        post_snake = postprocess_snake(snaked)
+        sink[valid_slicing] += post_snake[valid_slicing]
+    else:
+        snaked = snaked.astype(bool)
+        # invert snake if tissue is True. inversion only on not_low otherwise bg becomes True
+        if (snaked.sum() / not_low.sum()) > 0.5:
+            snaked = np.logical_and(np.logical_not(snaked), not_low)
+        sink[valid_slicing] += snaked[valid_slicing]
 
+    del not_low
     if not only_snake:
         # pseudo deconvolution
         parameter_deconvolution = parameter.get('deconvolve')
@@ -882,6 +880,18 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
     clipped = np.asarray(clipped, dtype=dtype)
     return clipped, mask, high, low
 
+def norm_log(source, clip_range, norm=MAX_BIN, dtype=DTYPE):
+    #TODO rescale intensities to generalize the pipeline
+    alpha = 10 # the lower the alpha the stronger the vessels signals. consider raising it if too much noise.
+    clip_low, clip_high = clip_range
+    logged = np.array(source[:], dtype=dtype)
+    low = logged < clip_low
+    logged[low] = 0
+    logged = np.log1p(alpha * (logged/np.max(logged)).astype(float))
+    logged *= float(norm - 1) / (np.max(logged) - np.min(logged))
+    logged = np.asarray(logged, dtype=dtype)
+    return logged
+
 def preprocess_snake(source, log_instead_of_clip):
     if not log_instead_of_clip:
         gamma_adjusted = adjust_gamma(source, 1.5)
@@ -897,8 +907,10 @@ def preprocess_snake(source, log_instead_of_clip):
 
     return bg_subtracted
 
-def snake(source):
-    return snk.morphological_chan_vese(source)
+def snake(source, mask):
+    # return rnk._apply_code(code.percentile, code.percentile_masked,
+    #                        source=source, selem=selem, sink=sink, mask=mask, parameter_float=percentile, **kwargs);
+    return snk.morphological_chan_vese(source.astype(np.float32), shape=np.array(source.shape, dtype=np.intp), mask=mask)
 
 def postprocess_snake(source):
     post_snake = np.zeros(source.shape, dtype=bool)
