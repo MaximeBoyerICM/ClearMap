@@ -530,7 +530,6 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         save = parameter_clip.pop('save', None)
         if log_instead_of_clip:
             _, mask, high, low = clip(source, **parameter_clip)
-            # clipped = run_step('log', source, norm_log, **default_step_params)
             clipped = norm_log(source, **parameter_clip)
         else:
             clipped, mask, high, low = clip(source, **parameter_clip)
@@ -538,13 +537,12 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
 
         if save:
             save = io.as_source(save)
-            print("DEBUG:", source.info(), source.slicing, base_slicing, valid_slicing)
             save[base_slicing] = clipped[valid_slicing]
 
-        # if binary_status is not None:
-        #     binary_status[high[valid_slicing]] += BINARY_STATUS['High']
-        # else:
-        #     sink[valid_slicing] = high[valid_slicing]
+        if binary_status is not None:
+            binary_status[high[valid_slicing]] += BINARY_STATUS['High']
+        else:
+            sink[valid_slicing] = high[valid_slicing]
 
         del high, low
 
@@ -563,24 +561,21 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     # median filter
     median = run_step('median', corrected, rnk.median, remove_previous_result=True,
                       extra_kwargs={'max_bin': max_bin, 'mask': not_low}, **default_step_params)
-
-    # active arrays: median, mask
+    # active arrays: median, mask, not_low
 
     # morphACWE
     pre_snake = preprocess_snake(median, log_instead_of_clip)
-    snaked = snk.morphological_chan_vese(image=pre_snake.astype(np.uint16), mask=mask.astype(np.uint8), shape=np.array(pre_snake.shape, dtype=np.intp))
 
-    if not only_snake:
-        post_snake = postprocess_snake(snaked)
-        sink[valid_slicing] += post_snake[valid_slicing]
-    else:
-        snaked = snaked.astype(bool)
-        # invert snake if tissue is True. inversion only on not_low otherwise bg becomes True
-        if (snaked.sum() / not_low.sum()) > 0.5:
-            snaked = np.logical_and(np.logical_not(snaked), not_low)
-        sink[valid_slicing] += snaked[valid_slicing]
+    snaked = snk.morphological_chan_vese(image=pre_snake.astype(np.uint16), mask=mask.astype(np.uint8), shape=np.array(pre_snake.shape, dtype=np.intp))
+    snaked = snaked.astype(bool)
+
+    small_objects_removal = only_snake
+    post_snake = postprocess_snake(source=snaked, mask=not_low, small_objects_removal=small_objects_removal)
+    sink[valid_slicing] += post_snake[valid_slicing]
 
     del not_low
+    # active arrays: median, mask, post_snake
+
     if not only_snake:
         # pseudo deconvolution
         parameter_deconvolution = parameter.get('deconvolve')
@@ -881,7 +876,7 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
     return clipped, mask, high, low
 
 def norm_log(source, clip_range, norm=MAX_BIN, dtype=DTYPE):
-    #TODO rescale intensities to generalize the pipeline
+    #TODO maybe rescale intensities to generalize the pipeline
     alpha = 10 # the lower the alpha the stronger the vessels signals. consider raising it if too much noise.
     clip_low, clip_high = clip_range
     logged = np.array(source[:], dtype=dtype)
@@ -907,17 +902,17 @@ def preprocess_snake(source, log_instead_of_clip):
 
     return bg_subtracted
 
-def snake(source, mask):
-    # return rnk._apply_code(code.percentile, code.percentile_masked,
-    #                        source=source, selem=selem, sink=sink, mask=mask, parameter_float=percentile, **kwargs);
-    return snk.morphological_chan_vese(source.astype(np.float32), shape=np.array(source.shape, dtype=np.intp), mask=mask)
+def postprocess_snake(source, mask, small_objects_removal):
+    # invert snake if tissue is True. inversion only on not_low otherwise bg becomes True
+    if (source.sum() / mask.sum()) > 0.5:
+        source = np.logical_and(np.logical_not(source), mask)
 
-def postprocess_snake(source):
     post_snake = np.zeros(source.shape, dtype=bool)
     post_snake[:] = source[:]
 
-    for z in range(post_snake.shape[0]):
-        post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=70)
+    if small_objects_removal:
+        for z in range(post_snake.shape[0]):
+            post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=70)
 
     return post_snake
 
