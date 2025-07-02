@@ -70,13 +70,17 @@ cpdef void update_curve(cnp.ndarray[UINT8,   ndim=3] u,
 cpdef cnp.ndarray[UINT8, ndim=3] morphological_chan_vese(
         cnp.ndarray[UINT16, ndim=3] image,
         cnp.ndarray[UINT8,  ndim=3] mask,
-        Py_ssize_t[:] shape,
         Py_ssize_t num_iter=15,
         float lambda1=1,
         float lambda2=1):
     """Segment *image* using MorphACWE."""
 
-    cdef cnp.ndarray[cnp.int8_t, ndim=3] init_ls = checkerboard_level_set(shape)
+    cdef int sx, sy, sz
+    sx = image.shape[0]
+    sy = image.shape[1]
+    sz = image.shape[2]
+
+    cdef cnp.ndarray[cnp.int8_t, ndim=3] init_ls = checkerboard_level_set((sx, sy, sz))
     cdef cnp.ndarray[UINT8, ndim=3] u = (init_ls > 0).astype(np.uint8)
 
     cdef Py_ssize_t i

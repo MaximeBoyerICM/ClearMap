@@ -15,10 +15,13 @@ __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
   
 import gc
+import multiprocessing
 import tempfile as tmpf
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import scipy.ndimage as ndi
+import skimage
 import skimage.filters as skif
 from skimage.morphology import remove_small_objects, remove_small_holes
 from skimage.exposure import adjust_gamma
@@ -35,6 +38,7 @@ import ClearMap.ImageProcessing.LightsheetCorrection as lc
 import ClearMap.ImageProcessing.Differentiation.Hessian as hes
 import ClearMap.ImageProcessing.Binary.Filling as bf
 import ClearMap.ImageProcessing.Binary.Smoothing as bs
+
 import ClearMap.ImageProcessing.Snake.morphsnake_1 as snk
 
 import ClearMap.Utils.Timer as tmr
@@ -79,6 +83,8 @@ default_binarization_parameter = dict(
     clip=dict(clip_range=(400, 60000),
               save=None),
 
+    log=dict(alpha=10),
+
     # lightsheet correction
     lightsheet=dict(percentile=0.25,
                     lightsheet=dict(selem=(150, 1, 1)),
@@ -92,6 +98,10 @@ default_binarization_parameter = dict(
     # median
     median=dict(selem=((3,)*3),
                 save=None),
+
+    snake=dict(lambda1=1.0,
+               lambda2=1.0,
+               n_iter=15),
 
     # deconvolution
     deconvolve=dict(sigma=10,
@@ -136,13 +146,13 @@ See :func:`binarize` for details."""
 
 default_binarization_processing_parameter = dict(
     size_max=500, #40
-    size_min=500, #5
-    overlap=0, #0
+    size_min=200, #5
+    overlap=50, #0
     axes=[1,2], #2
     optimization=True,
     optimization_fix='all',
     verbose=None,
-    processes=None
+    processes=multiprocessing.cpu_count() - 8,
 )
 """Parallel processing parameter for the vasculature binarization pipeline. 
 See :func:`ClearMap.ParallelProcessing.BlockProcessing.process`. for details."""       
@@ -192,7 +202,7 @@ def binarize(source, sink=None, binarization_parameter=default_binarization_para
         Parameter for the binarization. See below for details.
     processing_parameter : dict
         Parameter for the parallel processing.
-        See :func:`ClearMap.ParallelProcessing.BlockProcesing.process` for
+        See :func:`ClearMap.ParallelProcessing.BlockProcessing.process` for
         description of all the parameter.
 
     Returns
@@ -521,37 +531,57 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
                            'base_slicing': base_slicing, 'valid_slicing': valid_slicing}
 
     # clipping
-    parameter_clip = parameter.get('clip')
-    if parameter_clip:
-        parameter_clip, timer = print_params(parameter_clip, 'clip', prefix, verbose)
+    if not log_instead_of_clip:
+        parameter_clip = parameter.get('clip')
+        if parameter_clip:
+            parameter_clip, timer = print_params(parameter_clip, 'clip', prefix, verbose)
 
-        parameter_clip.update(norm=max_bin, dtype=DTYPE)
+            parameter_clip.update(norm=max_bin, dtype=DTYPE)
 
-        save = parameter_clip.pop('save', None)
-        if log_instead_of_clip:
-            _, mask, high, low = clip(source, **parameter_clip)
-            clipped = norm_log(source, **parameter_clip)
-        else:
+            save = parameter_clip.pop('save', None)
             clipped, mask, high, low = clip(source, **parameter_clip)
-        not_low = np.logical_not(low)
+            not_low = np.logical_not(low)
 
-        if save:
-            save = io.as_source(save)
-            save[base_slicing] = clipped[valid_slicing]
+            if save:
+                save = io.as_source(save)
+                save[base_slicing] = clipped[valid_slicing]
 
-        if binary_status is not None:
-            binary_status[high[valid_slicing]] += BINARY_STATUS['High']
+            if binary_status is not None:
+                binary_status[high[valid_slicing]] += BINARY_STATUS['High']
+            else:
+                sink[valid_slicing] = high[valid_slicing]
+
+            del high, low
+
+            if verbose:
+                timer.print_elapsed_time('Clipping')
         else:
-            sink[valid_slicing] = high[valid_slicing]
+            clipped = source
+            mask = not_low = np.ones(source.shape, dtype=bool)
+            low = np.zeros(source.shape, dtype=bool)
+        # active arrays: clipped, mask, not_low
 
-        del high, low
-
-        if verbose:
-            timer.print_elapsed_time('Clipping')
+    #log
     else:
-        clipped = source
-        mask = not_low = np.ones(source.shape, dtype=bool)
-    # active arrays: clipped, mask, not_low
+        parameter_log = parameter.get('log')
+        if parameter_log:
+            parameter_log, timer = print_params(parameter_log, 'log', prefix, verbose)
+            parameter_log.update(norm=max_bin, dtype=DTYPE)
+            save = parameter_log.pop('save', None)
+            log_flattened, high, low, mask = norm_log(source, **parameter_log)
+            not_low = np.logical_not(low)
+
+            if save:
+                save = io.as_source(save)
+                save[base_slicing] = log_flattened[valid_slicing]
+
+            if verbose:
+                timer.print_elapsed_time('Log')
+        else:
+            log_flattened = source
+            mask = not_low = np.ones(source.shape, dtype=bool)
+            low = np.zeros(source.shape, dtype=bool)
+        clipped = log_flattened
 
     # lightsheet correction
     corrected = run_step('lightsheet', clipped, lc.correct_lightsheet, remove_previous_result=True,
@@ -560,18 +590,27 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
 
     # median filter
     median = run_step('median', corrected, rnk.median, remove_previous_result=True,
-                      extra_kwargs={'max_bin': max_bin, 'mask': not_low}, **default_step_params)
+                      extra_kwargs={'mask': not_low, 'max_bin': max_bin}, **default_step_params)
+    # median = corrected
     # active arrays: median, mask, not_low
 
     # morphACWE
-    pre_snake = preprocess_snake(median, log_instead_of_clip)
+    parameter_snake = parameter.get('snake')
+    _ = '_' ; parameter_log, timer = print_params(parameter_snake, rf"Snake {_}/\{_}/\{_}o~", prefix, verbose)
+    pre_snake = preprocess_snake(median, log_instead_of_clip, low=low, not_low=not_low)
 
-    snaked = snk.morphological_chan_vese(image=pre_snake.astype(np.uint16), mask=mask.astype(np.uint8), shape=np.array(pre_snake.shape, dtype=np.intp))
+    snaked = snk.morphological_chan_vese(image=pre_snake,
+                                         mask=not_low.astype(np.uint8),
+                                         num_iter=15,
+                                         lambda1=1.0,
+                                         lambda2=1.0)
     snaked = snaked.astype(bool)
 
-    small_objects_removal = only_snake
+    small_objects_removal = not only_snake
     post_snake = postprocess_snake(source=snaked, mask=not_low, small_objects_removal=small_objects_removal)
     sink[valid_slicing] += post_snake[valid_slicing]
+
+    timer.print_elapsed_time(r"Snake _/\_/\_o~")
 
     del not_low
     # active arrays: median, mask, post_snake
@@ -875,32 +914,42 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
     clipped = np.asarray(clipped, dtype=dtype)
     return clipped, mask, high, low
 
-def norm_log(source, clip_range, norm=MAX_BIN, dtype=DTYPE):
-    #TODO maybe rescale intensities to generalize the pipeline
-    alpha = 10 # the lower the alpha the stronger the vessels signals. consider raising it if too much noise.
-    clip_low, clip_high = clip_range
+def norm_log(source, clip_range, alpha, norm=MAX_BIN, dtype=DTYPE):
+    """the lower the alpha the stronger the vessels signals and the less permissive the segmentation.
+    consider lowering it if too much noise.
+    consider raising it if it is not capturing enough"""
     logged = np.array(source[:], dtype=dtype)
+    clip_low, clip_high = clip_range
     low = logged < clip_low
+    high = logged > clip_high
     logged[low] = 0
+    mask = np.logical_not(np.logical_or(low, high))
+    # logged = clip_high_tail(logged)
     logged = np.log1p(alpha * (logged/np.max(logged)).astype(float))
-    logged *= float(norm - 1) / (np.max(logged) - np.min(logged))
+    logged *= float(norm - 1) / (np.max(logged) - np.min(logged) + 1e-8)
     logged = np.asarray(logged, dtype=dtype)
-    return logged
+    return logged, high, low, mask
 
-def preprocess_snake(source, log_instead_of_clip):
+def clip_high_tail(source, percentile=99.5):
+    threshold = np.percentile(source, percentile)
+    return np.clip(source, a_min=None, a_max=threshold)
+
+def preprocess_snake(source, log_instead_of_clip, low, not_low):
     if not log_instead_of_clip:
-        gamma_adjusted = adjust_gamma(source, 1.5)
+        gamma_adjusted = adjust_gamma(source, 1.5) # compensate for clipping
     else:
         gamma_adjusted = source
+
     background = np.zeros(source.shape, dtype=float)
     background[:] = gamma_adjusted[:]
+    background[low] = np.median(gamma_adjusted[not_low])
 
     for z in range(background.shape[2]):
-        background[:, :, z] = ndi.gaussian_filter(background[:, :, z], sigma=20)
+        background[:, :, z] = ndi.gaussian_filter(background[:, :, z], sigma=50)
 
     bg_subtracted = gamma_adjusted - np.minimum(gamma_adjusted, background)
-
-    return bg_subtracted
+    # np.save("/network/iss/renier/users/maxime.boyer/1_Projects/0_VasculatureSeg/0_MorphSnake/0_Results/3_ClearMap/250415/250415-1/bg.npy",bg_subtracted)
+    return bg_subtracted.astype(np.uint16)
 
 def postprocess_snake(source, mask, small_objects_removal):
     # invert snake if tissue is True. inversion only on not_low otherwise bg becomes True
@@ -913,6 +962,9 @@ def postprocess_snake(source, mask, small_objects_removal):
     if small_objects_removal:
         for z in range(post_snake.shape[0]):
             post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=70)
+    else:
+        for z in range(post_snake.shape[0]):
+            post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=4)
 
     return post_snake
 
@@ -962,27 +1014,41 @@ def equalize(source, percentile=(0.5, 0.95), max_value=1.5, selem=(200, 200, 5),
 def tubify(source, sigma=1.0, gamma12=1.0, gamma23=1.0, alpha=0.25):
     return hes.lambda123(source=source, sink=None, sigma=sigma, gamma12=gamma12, gamma23=gamma23, alpha=alpha)
 
-def slice_filling(source):
+def apply_remove_holes_block(arr, axis, start, end, area_threshold):
+    slicer = [slice(None)] * arr.ndim
+    slicer[axis] = slice(start, end)
+    slc = tuple(slicer)
+    arr[slc] = remove_holes(arr[slc], area_threshold=area_threshold)
+
+def remove_holes(arr, area_threshold, connectivity=1):
+    inv = ~arr
+    filled = remove_small_objects(inv, min_size=area_threshold, connectivity=connectivity)
+    return ~(filled > 0)
+
+def apply_remove_holes_along_axis(arr, axis, step, area_threshold, processes):
+    size = arr.shape[axis]
+    tasks = []
+
+    with ThreadPoolExecutor(max_workers=processes) as executor:
+        for start in range(0, size, step):
+            end = min(start + step, size)
+            tasks.append(executor.submit(apply_remove_holes_block, arr, axis, start, end, area_threshold))
+
+        for task in tasks:
+            task.result()
+
+    return arr
+
+
+def slice_filling(source, step=4, processes=10):
     filled = source
 
-    step = 4
-    for axis in [0, 1]:
-        size_slice = source.shape[(axis + 1) % 3] * source.shape[(axis + 2) % 3]
-        area_threshold = size_slice // 3
-        filled = apply_remove_small_holes_along_axis(filled, axis=axis, step=step, area_threshold=area_threshold)
+    for axis in range(3):
+        size_slice = filled.shape[(axis + 1) % 3] * filled.shape[(axis + 2) % 3]
+        area_threshold = size_slice // 6
+        filled = apply_remove_holes_along_axis(filled, axis, step, area_threshold, processes)
 
     return filled
-
-def apply_remove_small_holes_along_axis(arr, axis, step, area_threshold):
-    slicer = [slice(None)] * arr.ndim
-    size = arr.shape[axis]
-
-    for start in range(0, size, step):
-        end = min(start + step, size)
-        slicer[axis] = slice(start, end)
-        slc = tuple(slicer)
-        arr[slc] = remove_small_holes(arr[slc], area_threshold=area_threshold, connectivity=1)
-    return arr
 
 ###############################################################################
 # ## Helper
