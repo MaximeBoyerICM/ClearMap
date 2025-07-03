@@ -596,7 +596,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
 
     # morphACWE
     parameter_snake = parameter.get('snake')
-    _ = '_' ; parameter_log, timer = print_params(parameter_snake, rf"Snake {_}/\{_}/\{_}o~", prefix, verbose)
+    parameter_log, timer = print_params(parameter_snake, "Snake", prefix, verbose)
     pre_snake = preprocess_snake(median, log_instead_of_clip, low=low, not_low=not_low)
 
     snaked = snk.morphological_chan_vese(image=pre_snake,
@@ -935,20 +935,22 @@ def clip_high_tail(source, percentile=99.5):
     return np.clip(source, a_min=None, a_max=threshold)
 
 def preprocess_snake(source, log_instead_of_clip, low, not_low):
+    """Background subtraction by masked gaussian difference"""
     if not log_instead_of_clip:
         gamma_adjusted = adjust_gamma(source, 1.5) # compensate for clipping
     else:
         gamma_adjusted = source
 
     background = np.zeros(source.shape, dtype=float)
-    background[:] = gamma_adjusted[:]
-    background[low] = np.median(gamma_adjusted[not_low])
+    background[not_low] = gamma_adjusted[not_low]
 
-    for z in range(background.shape[2]):
-        background[:, :, z] = ndi.gaussian_filter(background[:, :, z], sigma=50)
+    smoothed = ndi.gaussian_filter(background, sigma=(50, 50, 0))
+    norm = ndi.gaussian_filter(not_low.astype(float), sigma=(50, 50, 0))
+
+    norm[norm == 0] = 1e-8
+    background = smoothed / norm
 
     bg_subtracted = gamma_adjusted - np.minimum(gamma_adjusted, background)
-    # np.save("/network/iss/renier/users/maxime.boyer/1_Projects/0_VasculatureSeg/0_MorphSnake/0_Results/3_ClearMap/250415/250415-1/bg.npy",bg_subtracted)
     return bg_subtracted.astype(np.uint16)
 
 def postprocess_snake(source, mask, small_objects_removal):
