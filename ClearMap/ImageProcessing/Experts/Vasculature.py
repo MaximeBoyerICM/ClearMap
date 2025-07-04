@@ -857,6 +857,9 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
         save = False
 
     if run_binary_filling:
+        if verbose:
+            timer = tmr.Timer()
+            print('Binary filling...', flush=True)
         filled = slice_filling(fill_source)
         bf.fill(filled, sink=sink, processes=processes, verbose=verbose)
         if parameter_smooth and not save:
@@ -965,6 +968,7 @@ def postprocess_snake(source, mask, small_objects_removal):
         for z in range(post_snake.shape[0]):
             post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=70)
     else:
+        # clean small snake artifacts
         for z in range(post_snake.shape[0]):
             post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=4)
 
@@ -1012,9 +1016,9 @@ def equalize(source, percentile=(0.5, 0.95), max_value=1.5, selem=(200, 200, 5),
     equalized = np.array(source, dtype=float) * normalize
     return equalized
 
-
 def tubify(source, sigma=1.0, gamma12=1.0, gamma23=1.0, alpha=0.25):
     return hes.lambda123(source=source, sink=None, sigma=sigma, gamma12=gamma12, gamma23=gamma23, alpha=alpha)
+
 
 def apply_remove_holes_block(arr, axis, start, end, area_threshold):
     slicer = [slice(None)] * arr.ndim
@@ -1041,13 +1045,13 @@ def apply_remove_holes_along_axis(arr, axis, step, area_threshold, processes):
 
     return arr
 
-
 def slice_filling(source, step=4, processes=10):
+    # step=4 avoids filling loops
     filled = source
 
     for axis in range(3):
         size_slice = filled.shape[(axis + 1) % 3] * filled.shape[(axis + 2) % 3]
-        area_threshold = size_slice // 6
+        area_threshold = size_slice // 6 #TODO find something else than 6.
         filled = apply_remove_holes_along_axis(filled, axis, step, area_threshold, processes)
 
     return filled
