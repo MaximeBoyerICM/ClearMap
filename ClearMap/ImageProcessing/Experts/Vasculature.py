@@ -570,6 +570,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             save = parameter_log.pop('save', None)
             log_flattened, high, low, mask = norm_log(source, **parameter_log)
             not_low = np.logical_not(low)
+            sink[valid_slicing] = high[valid_slicing]  # WARNING: maybe remove in some cases?
 
             if save:
                 save = io.as_source(save)
@@ -600,7 +601,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     pre_snake = preprocess_snake(median, log_instead_of_clip, mask=mask, not_low=not_low)
 
     snaked = snk.morphological_chan_vese(image=pre_snake,
-                                         mask=not_low.astype(np.uint8),
+                                         mask=mask.astype(np.uint8), # seems to work better with mask instead of not_low
                                          num_iter=15,
                                          lambda1=1.0,
                                          lambda2=1.0)
