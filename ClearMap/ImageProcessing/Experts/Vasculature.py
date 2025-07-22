@@ -584,16 +584,19 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             low = np.zeros(source.shape, dtype=bool)
         clipped = log_flattened
 
+    del high
+
     # lightsheet correction
     corrected = run_step('lightsheet', clipped, lc.correct_lightsheet, remove_previous_result=True,
                          extra_kwargs={'mask': mask, 'max_bin': max_bin}, **default_step_params)
     # active arrays: corrected, mask, not_low
+    del clipped
 
     # median filter
     median = run_step('median', corrected, rnk.median, remove_previous_result=True,
                       extra_kwargs={'mask': not_low, 'max_bin': max_bin}, **default_step_params)
-    # median = corrected
     # active arrays: median, mask, not_low
+    del corrected
 
     # morphACWE
     parameter_snake = parameter.get('snake')
@@ -605,15 +608,17 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
                                          num_iter=15,
                                          lambda1=1.0,
                                          lambda2=1.0)
-    snaked = snaked.astype(bool)
 
+    del pre_snake
+
+    snaked = snaked.astype(bool)
     small_objects_removal = not only_snake
     post_snake = postprocess_snake(source=snaked, mask=not_low, small_objects_removal=small_objects_removal)
     sink[valid_slicing] += post_snake[valid_slicing]
 
     timer.print_elapsed_time(r"Snake _/\_/\_o~")
 
-    del not_low
+    del not_low, post_snake
     # active arrays: median, mask, post_snake
 
     if not only_snake:
