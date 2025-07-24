@@ -506,6 +506,7 @@ def binarize(source, sink=None, binarization_parameter=default_binarization_para
 def binarize_block(source, sink, parameter=default_binarization_parameter):
     """Binarize a Block."""
     only_snake=  True
+    no_snake = False
     log_instead_of_clip = True
 
     # initialize parameter and slicings
@@ -572,6 +573,8 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             not_low = np.logical_not(low)
             sink[valid_slicing] = high[valid_slicing]  # WARNING: maybe remove in some cases?
 
+            del high
+
             if save:
                 save = io.as_source(save)
                 save[base_slicing] = log_flattened[valid_slicing]
@@ -584,13 +587,14 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             low = np.zeros(source.shape, dtype=bool)
         clipped = log_flattened
 
-    del high
-
     # lightsheet correction
-    corrected = run_step('lightsheet', clipped, lc.correct_lightsheet, remove_previous_result=True,
-                         extra_kwargs={'mask': mask, 'max_bin': max_bin}, **default_step_params)
-    # active arrays: corrected, mask, not_low
+    if not only_snake:
+        corrected = run_step('lightsheet', clipped, lc.correct_lightsheet, remove_previous_result=True,
+                             extra_kwargs={'mask': mask, 'max_bin': max_bin}, **default_step_params)
+    else :
+        corrected = clipped
     del clipped
+    # active arrays: corrected, mask, not_low
 
     # median filter
     median = run_step('median', corrected, rnk.median, remove_previous_result=True,
@@ -933,15 +937,10 @@ def norm_log(source, clip_range, alpha, norm=MAX_BIN, dtype=DTYPE):
     high = logged > clip_high
     logged[low] = 0
     mask = np.logical_not(np.logical_or(low, high))
-    # logged = clip_high_tail(logged)
     logged = np.log1p(alpha * (logged/np.max(logged)).astype(float))
     logged *= float(norm - 1) / (np.max(logged) - np.min(logged) + 1e-8)
     logged = np.asarray(logged, dtype=dtype)
     return logged, high, low, mask
-
-def clip_high_tail(source, percentile=99.5):
-    threshold = np.percentile(source, percentile)
-    return np.clip(source, a_min=None, a_max=threshold)
 
 def preprocess_snake(source, log_instead_of_clip, mask, not_low):
     """Selective background subtraction by masked gaussian difference"""
@@ -950,13 +949,13 @@ def preprocess_snake(source, log_instead_of_clip, mask, not_low):
     else:
         gamma_adjusted = source
 
-    background = np.zeros(source.shape, dtype=float)
-    background[not_low] = gamma_adjusted[not_low]
-
-    smoothed = ndi.gaussian_filter(background, sigma=(10, 10, 10))
-    norm = ndi.gaussian_filter(mask.astype(float), sigma=(10, 10, 10))
+    smoothed = np.zeros_like(gamma_adjusted)
+    smoothed[mask] = gamma_adjusted[mask]
+    smoothed = ndi.gaussian_filter(smoothed, sigma=(13, 13, 13))
+    norm = ndi.gaussian_filter(not_low.astype(float), sigma=(13, 13, 13))
 
     norm[norm == 0] = 1e-8
+
     background = smoothed / norm
 
     bg_subtracted = gamma_adjusted - np.minimum(gamma_adjusted, background)
@@ -970,13 +969,10 @@ def postprocess_snake(source, mask, small_objects_removal):
     post_snake = np.zeros(source.shape, dtype=bool)
     post_snake[:] = source[:]
 
-    if small_objects_removal:
-        for z in range(post_snake.shape[0]):
-            post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=70)
-    else:
-        # clean small snake artifacts
-        for z in range(post_snake.shape[0]):
-            post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=4)
+    min_size = 70 if small_objects_removal else 4
+
+    for z in range(post_snake.shape[0]):
+        post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=min_size)
 
     return post_snake
 
