@@ -273,8 +273,10 @@ class BinaryVesselProcessor(TabProcessor):
 
         if channel != self.all_vessels_channel:  # For arteries or veins
             binarization_parameter.update(equalize=None, vesselize=None)
-
-        processing_parameter = copy.deepcopy(vasculature.default_binarization_processing_parameter)
+            processing_parameter = copy.deepcopy(vasculature.default_binarization_processing_parameter)
+            processing_parameter["axes"]=[0, 2]  # WARNING temporary solution to avoid segmenting striatum
+        else:
+            processing_parameter = copy.deepcopy(vasculature.default_binarization_processing_parameter)
         processing_parameter.update(processes=self.machine_config['n_processes_binarization'],
                                     as_memory=True, verbose=True)
 

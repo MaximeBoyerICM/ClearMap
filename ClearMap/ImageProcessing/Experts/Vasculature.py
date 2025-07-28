@@ -145,10 +145,10 @@ See :func:`binarize` for details."""
 
 
 default_binarization_processing_parameter = dict(
-    size_max=500, #40
+    size_max=300, #40
     size_min=200, #5
-    overlap=50, #0
-    axes=[1,2], #2
+    overlap=20, #0
+    axes=[0, 2], #2
     optimization=True,
     optimization_fix='all',
     verbose=None,
