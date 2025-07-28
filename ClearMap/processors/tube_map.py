@@ -262,7 +262,7 @@ class BinaryVesselProcessor(TabProcessor):
         binarization_cfg = self.processing_config['binarization'][channel]
         binarization_parameter['clip']['clip_range'] = binarization_cfg['binarize']['clip_range']
         binarization_parameter['log']['clip_range'] = binarization_cfg['binarize']['clip_range']
-        binarization_parameter['log']['alpha'] = binarization_cfg['binarize']['alpha']
+        binarization_parameter['log']['scaling_factor'] = binarization_cfg['binarize']['alpha']
         # for step in binarization_parameter.keys():
         #     if isinstance(binarization_parameter[step], dict) and step in ["log", "lightsheet", "median"]:
         #         binarization_parameter[step]['save'] = sink.parent / f"inter_{step}_{channel}.npy"

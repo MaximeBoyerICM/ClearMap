@@ -569,7 +569,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             parameter_log, timer = print_params(parameter_log, 'log', prefix, verbose)
             parameter_log.update(norm=max_bin, dtype=DTYPE)
             save = parameter_log.pop('save', None)
-            log_flattened, high, low, mask = norm_log(source, **parameter_log)
+            log_flattened, high, low, mask = clip_log(source, **parameter_log)
             not_low = np.logical_not(low)
             sink[valid_slicing] = high[valid_slicing]  # WARNING: maybe remove in some cases?
 
@@ -927,23 +927,29 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
     clipped = np.asarray(clipped, dtype=dtype)
     return clipped, mask, high, low
 
-def norm_log(source, clip_range, alpha, norm=MAX_BIN, dtype=DTYPE):
-    """the lower the alpha the stronger the vessels signals and the less permissive the segmentation.
-    consider lowering it if too much noise.
-    consider raising it if it is not capturing enough"""
+def clip_log(source, clip_range, scaling_factor, norm=MAX_BIN, dtype=DTYPE):
+    """
+    1) Build masks based on clip ranges
+    2) Apply a log
+    3) Normalize the image to MAX_BIN
+
+    N.B: The lower the scaling_factor the stronger the vessels signals and the less permissive the segmentation.
+    Consider lowering it if too much noise.
+    Consider raising it if it is not capturing enough.
+    """
     logged = np.array(source[:], dtype=dtype)
     clip_low, clip_high = clip_range
     low = logged < clip_low
     high = logged > clip_high
     logged[low] = 0
     mask = np.logical_not(np.logical_or(low, high))
-    logged = np.log1p(alpha * (logged/np.max(logged)).astype(float))
+    logged = np.log1p(scaling_factor * (logged / np.max(logged)).astype(float))
     logged *= float(norm - 1) / (np.max(logged) - np.min(logged) + 1e-8)
     logged = np.asarray(logged, dtype=dtype)
     return logged, high, low, mask
 
 def preprocess_snake(source, log_instead_of_clip, mask, not_low):
-    """Selective background subtraction by masked gaussian difference"""
+    """Selective background subtraction by masked gaussian difference (normalized convolution)."""
     if not log_instead_of_clip:
         gamma_adjusted = adjust_gamma(source, 1.5) # compensate for clipping
     else:
@@ -953,16 +959,25 @@ def preprocess_snake(source, log_instead_of_clip, mask, not_low):
     smoothed[mask] = gamma_adjusted[mask]
     smoothed = ndi.gaussian_filter(smoothed, sigma=(13, 13, 13))
     norm = ndi.gaussian_filter(not_low.astype(float), sigma=(13, 13, 13))
-
+    np.save("/network/iss/renier/users/maxime.boyer/1_Projects/0_VasculatureSeg/0_MorphSnake/0_Results/3_ClearMap/250415/250415-1/smoothed.npy", smoothed)
     norm[norm == 0] = 1e-8
+    np.save("/network/iss/renier/users/maxime.boyer/1_Projects/0_VasculatureSeg/0_MorphSnake/0_Results/3_ClearMap/250415/250415-1/norm.npy", norm)
+
 
     background = smoothed / norm
-
     bg_subtracted = gamma_adjusted - np.minimum(gamma_adjusted, background)
+    background[~not_low] = 0
+    np.save("/network/iss/renier/users/maxime.boyer/1_Projects/0_VasculatureSeg/0_MorphSnake/0_Results/3_ClearMap/250415/250415-1/bg_norm.npy", background)
+
+
     return bg_subtracted.astype(np.uint16)
 
 def postprocess_snake(source, mask, small_objects_removal):
-    # invert snake if tissue is True. inversion only on not_low otherwise bg becomes True
+    """
+    1) Check foreground/background labeling and inverts it if needed.
+    2) Remove small dots (morphACWE artifacts)
+    2b) Optionally remove small objects if small_objects_removal=True
+    """
     if (source.sum() / mask.sum()) > 0.5:
         source = np.logical_and(np.logical_not(source), mask)
 
@@ -972,6 +987,7 @@ def postprocess_snake(source, mask, small_objects_removal):
     min_size = 70 if small_objects_removal else 4
 
     for z in range(post_snake.shape[0]):
+        # TODO check if this is really needed. Can smooth_by_configuration do it ?
         post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=min_size)
 
     return post_snake
