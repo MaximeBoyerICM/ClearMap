@@ -959,15 +959,11 @@ def preprocess_snake(source, log_instead_of_clip, mask, not_low):
     smoothed[mask] = gamma_adjusted[mask]
     smoothed = ndi.gaussian_filter(smoothed, sigma=(13, 13, 13))
     norm = ndi.gaussian_filter(not_low.astype(float), sigma=(13, 13, 13))
-    np.save("/network/iss/renier/users/maxime.boyer/1_Projects/0_VasculatureSeg/0_MorphSnake/0_Results/3_ClearMap/250415/250415-1/smoothed.npy", smoothed)
     norm[norm == 0] = 1e-8
-    np.save("/network/iss/renier/users/maxime.boyer/1_Projects/0_VasculatureSeg/0_MorphSnake/0_Results/3_ClearMap/250415/250415-1/norm.npy", norm)
-
 
     background = smoothed / norm
     bg_subtracted = gamma_adjusted - np.minimum(gamma_adjusted, background)
     background[~not_low] = 0
-    np.save("/network/iss/renier/users/maxime.boyer/1_Projects/0_VasculatureSeg/0_MorphSnake/0_Results/3_ClearMap/250415/250415-1/bg_norm.npy", background)
 
 
     return bg_subtracted.astype(np.uint16)
