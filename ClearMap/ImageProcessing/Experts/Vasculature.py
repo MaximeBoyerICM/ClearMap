@@ -83,8 +83,6 @@ default_binarization_parameter = dict(
     clip=dict(clip_range=(400, 60000),
               save=None),
 
-    log=dict(alpha=10),
-
     # lightsheet correction
     lightsheet=dict(percentile=0.25,
                     lightsheet=dict(selem=(150, 1, 1)),
@@ -96,17 +94,25 @@ default_binarization_parameter = dict(
                     save=None),
 
     # median
-    median=dict(selem=((3,)*3),
+    median=dict(selem=((3,) * 3),
                 save=None),
 
-    snake=dict(lambda1=1.0,
-               lambda2=1.0,
-               n_iter=15),
+    # background removal
+    background_removal=dict(sigma=13,
+                            sigma_mask=15),
 
     # deconvolution
     deconvolve=dict(sigma=10,
                     threshold=750,
                     save=None),
+
+     # gamma correction
+    gamma=dict(gamma=0.45),
+
+    # snake
+    snake=dict(lambda1=1.0,
+               lambda2=1.0,
+               n_iter=15),
 
     # equalization
     equalize=dict(percentile=(0.4, 0.975),
@@ -130,12 +136,6 @@ default_binarization_parameter = dict(
                    threshold=120,
                    save=None),
 
-    # fill
-    fill=None,
-
-    # smooth
-    smooth=None,
-
     # controls
     binary_status=None,
     max_bin=MAX_BIN
@@ -143,12 +143,11 @@ default_binarization_parameter = dict(
 """Parameter for the vasculature binarization pipeline. 
 See :func:`binarize` for details."""
 
-
 default_binarization_processing_parameter = dict(
-    size_max=300, #40
-    size_min=200, #5
-    overlap=20, #0
-    axes=[0, 2], #2
+    size_max=400,
+    size_min=250,
+    overlap=5,
+    axes=[0,2],
     optimization=True,
     optimization_fix='all',
     verbose=None,
@@ -157,7 +156,6 @@ default_binarization_processing_parameter = dict(
 """Parallel processing parameter for the vasculature binarization pipeline. 
 See :func:`ClearMap.ParallelProcessing.BlockProcessing.process`. for details."""       
 
-                   
 default_postprocessing_parameter = dict(
     # binary smoothing
     smooth=dict(iterations=6),
@@ -167,26 +165,24 @@ default_postprocessing_parameter = dict(
 
     # temporary file
     temporary_filename=None
-)                   
+)
 """Parameter for the postprocessing step of the binarized data.
 See :func:`postprocess` for details."""
 
-
 default_postprocessing_processing_parameter = dict(
-    overlap=None,
     size_min=None,
     optimization=True,
     optimization_fix='all',
     as_memory=True
 )
 """Parallel processing parameter for the vasculature postprocessing pipeline. 
-See :func:`ClearMap.ParallelProcessing.BlockProcessing.process`. for details."""     
+See :func:`ClearMap.ParallelProcessing.BlockProcessing.process`. for details."""
 
 
 ###############################################################################
 # ## Binarization
 ###############################################################################
-                   
+
 def binarize(source, sink=None, binarization_parameter=default_binarization_parameter,
              processing_parameter=default_binarization_processing_parameter):
     """
@@ -505,10 +501,6 @@ def binarize(source, sink=None, binarization_parameter=default_binarization_para
 
 def binarize_block(source, sink, parameter=default_binarization_parameter):
     """Binarize a Block."""
-    only_snake=  True
-    no_snake = False
-    log_instead_of_clip = True
-
     # initialize parameter and slicings
     verbose = parameter.get('verbose', False)
     if verbose:
@@ -532,263 +524,221 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
                            'base_slicing': base_slicing, 'valid_slicing': valid_slicing}
 
     # clipping
-    if not log_instead_of_clip:
-        parameter_clip = parameter.get('clip')
-        if parameter_clip:
-            parameter_clip, timer = print_params(parameter_clip, 'clip', prefix, verbose)
+    parameter_clip = parameter.get('clip')
+    if parameter_clip:
+        parameter_clip, timer = print_params(parameter_clip, 'clip', prefix, verbose)
 
-            parameter_clip.update(norm=max_bin, dtype=DTYPE)
+        parameter_clip.update(norm=max_bin, dtype=DTYPE)
 
-            save = parameter_clip.pop('save', None)
-            clipped, mask, high, low = clip(source, **parameter_clip)
-            not_low = np.logical_not(low)
+        save = parameter_clip.pop('save', None)
+        clipped, mask, high, low = clip(source, **parameter_clip)
+        not_low = np.logical_not(low)
 
-            if save:
-                save = io.as_source(save)
-                save[base_slicing] = clipped[valid_slicing]
+        if save:
+            save = io.as_source(save)
+            save[base_slicing] = clipped[valid_slicing]
 
-            if binary_status is not None:
-                binary_status[high[valid_slicing]] += BINARY_STATUS['High']
-            else:
-                sink[valid_slicing] = high[valid_slicing]
-
-            del high, low
-
-            if verbose:
-                timer.print_elapsed_time('Clipping')
+        if binary_status is not None:
+            binary_status[high[valid_slicing]] += BINARY_STATUS['High']
         else:
-            clipped = source
-            mask = not_low = np.ones(source.shape, dtype=bool)
-            low = np.zeros(source.shape, dtype=bool)
-        # active arrays: clipped, mask, not_low
+            sink[valid_slicing] = high[valid_slicing]
 
-    #log
+        del high, low
+
+        if verbose:
+            timer.print_elapsed_time('Clipping')
     else:
-        parameter_log = parameter.get('log')
-        if parameter_log:
-            parameter_log, timer = print_params(parameter_log, 'log', prefix, verbose)
-            parameter_log.update(norm=max_bin, dtype=DTYPE)
-            save = parameter_log.pop('save', None)
-            log_flattened, high, low, mask = clip_log(source, **parameter_log)
-            not_low = np.logical_not(low)
-            sink[valid_slicing] = high[valid_slicing]  # WARNING: maybe remove in some cases?
-
-            del high
-
-            if save:
-                save = io.as_source(save)
-                save[base_slicing] = log_flattened[valid_slicing]
-
-            if verbose:
-                timer.print_elapsed_time('Log')
-        else:
-            log_flattened = source
-            mask = not_low = np.ones(source.shape, dtype=bool)
-            low = np.zeros(source.shape, dtype=bool)
-        clipped = log_flattened
+        clipped = source
+        mask = not_low = np.ones(source.shape, dtype=bool)
+    # active arrays: clipped, mask, not_low
 
     # lightsheet correction
-    if not only_snake:
+    parameter_ls_correction = parameter.get('lightsheet_correction')
+    if parameter_ls_correction:
         corrected = run_step('lightsheet', clipped, lc.correct_lightsheet, remove_previous_result=True,
                              extra_kwargs={'mask': mask, 'max_bin': max_bin}, **default_step_params)
-    else :
+    else:
         corrected = clipped
     del clipped
     # active arrays: corrected, mask, not_low
 
     # median filter
-    median = run_step('median', corrected, rnk.median, remove_previous_result=True,
-                      extra_kwargs={'mask': not_low, 'max_bin': max_bin}, **default_step_params)
-    # active arrays: median, mask, not_low
+    parameter_median = parameter.get('median')
+    if parameter_median:
+        median = run_step('median', corrected, rnk.median, remove_previous_result=True,
+                          extra_kwargs={'mask': not_low, 'max_bin': max_bin}, **default_step_params)
+    else:
+        median = corrected
     del corrected
+    # active arrays: median, mask, not_low
+
+    # background removal
+    parameter_bg_removal = parameter.get('background_removal')
+    if parameter_bg_removal:
+        bg_subtracted = remove_background(median, mask, not_low, **parameter_bg_removal)
+    else:
+        bg_subtracted = median
+    # active arrays: bg_subtracted, median, mask, not_low
+
+    parameter_deconvolution = parameter.get('deconvolve')
+    if parameter_deconvolution:
+        parameter_deconvolution, timer = print_params(parameter_deconvolution, 'deconvolve', prefix, verbose)
+
+        save = parameter_deconvolution.pop('save', None)
+        threshold = parameter_deconvolution.pop('threshold', None)
+
+        if binary_status is not None:
+            binarized = binary_status > 0
+        else:
+            binarized = sink[:]
+        deconvolved = deconvolve(bg_subtracted, binarized[:], **parameter_deconvolution)
+        del binarized
+
+        if save:
+            save = io.as_source(save)
+            save[base_slicing] = deconvolved[valid_slicing]
+
+        if verbose:
+            timer.print_elapsed_time('Deconvolution')
+    else:
+        deconvolved = bg_subtracted
+    del bg_subtracted
+    # active arrays: deconvolved, median, mask, not_low
+
+    # gamma correction
+    parameter_gamma = parameter.get('gamma')
+    if parameter_gamma:
+        gamma_corrected = adjust_gamma(deconvolved, **parameter_gamma)
+    else:
+        gamma_corrected = deconvolved
+    # active arrays: gamma_corrected, median, mask, not_low
 
     # morphACWE
     parameter_snake = parameter.get('snake')
-    parameter_log, timer = print_params(parameter_snake, "Snake", prefix, verbose)
-    pre_snake = preprocess_snake(median, log_instead_of_clip, mask=mask, not_low=not_low)
+    if parameter_snake:
+        parameter_snake, timer = print_params(parameter_snake, "Snake", prefix, verbose)
 
-    snaked = snk.morphological_chan_vese(image=pre_snake,
-                                         mask=mask.astype(np.uint8), # seems to work better with mask instead of not_low
-                                         num_iter=15,
-                                         lambda1=1.0,
-                                         lambda2=1.0)
+        snaked = snk.morphological_chan_vese(image=gamma_corrected.astype(np.uint16),
+                                             mask=mask.astype(np.uint8),
+                                             **parameter_snake)
 
-    del pre_snake
+        snaked = snaked.astype(bool)
+        post_snake = postprocess_snake(source=snaked, mask=not_low)
+        sink[valid_slicing] += post_snake[valid_slicing]
+        timer.print_elapsed_time(r"Snake _/\_/\_o~")
+    del not_low
+    # active arrays: gamma_corrected, median, mask
 
-    snaked = snaked.astype(bool)
-    small_objects_removal = not only_snake
-    post_snake = postprocess_snake(source=snaked, mask=not_low, small_objects_removal=small_objects_removal)
-    sink[valid_slicing] += post_snake[valid_slicing]
-
-    timer.print_elapsed_time(r"Snake _/\_/\_o~")
-
-    del not_low, post_snake
-    # active arrays: median, mask, post_snake
-
-    if not only_snake:
-        # pseudo deconvolution
-        parameter_deconvolution = parameter.get('deconvolve')
-        if parameter_deconvolution:
-            parameter_deconvolution, timer = print_params(parameter_deconvolution, 'deconvolve', prefix, verbose)
-
-            save = parameter_deconvolution.pop('save', None)
-            threshold = parameter_deconvolution.pop('threshold', None)
-
-            if binary_status is not None:
-                binarized = binary_status > 0
-            else:
-                binarized = sink[:]
-            deconvolved = deconvolve(median, binarized[:], **parameter_deconvolution)
-            del binarized
-
-            if save:
-                save = io.as_source(save)
-                save[base_slicing] = deconvolved[valid_slicing]
-
-            if verbose:
-                timer.print_elapsed_time('Deconvolution')
-
-            if threshold:
-                binary_deconvolved = deconvolved > threshold
-
-                if binary_status is not None:
-                    binary_status[binary_deconvolved[valid_slicing]] += BINARY_STATUS['Deconvolved']
-                else:
-                    sink[valid_slicing] += binary_deconvolved[valid_slicing]
-
-                del binary_deconvolved
-
-                if verbose:
-                    timer.print_elapsed_time('Deconvolution: binarization')
-        else:
-            deconvolved = median
-
-        # active arrays: median, mask, deconvolved
-
-        # adaptive
-        parameter_adaptive = parameter.get('adaptive')
-        adaptive = run_step('adaptive', deconvolved, threshold_adaptive, remove_previous_result=False,
+    # adaptive
+    parameter_adaptive = parameter.get('adaptive')
+    if parameter_adaptive:
+        adaptive = run_step('adaptive', gamma_corrected, threshold_adaptive, remove_previous_result=False,
                             **default_step_params)
-        if parameter_adaptive:
-            binary_adaptive = deconvolved > adaptive
+        binary_adaptive = gamma_corrected > adaptive
+
+        if binary_status is not None:
+            binary_status[binary_adaptive[valid_slicing]] += BINARY_STATUS['Adaptive']
+        else:
+            sink[valid_slicing] += binary_adaptive[valid_slicing]
+
+        del binary_adaptive, adaptive
+    del gamma_corrected
+    # active arrays: median, mask
+
+    # equalize
+    parameter_equalize = parameter.get('equalize')
+    if parameter_equalize:
+        parameter_equalize, timer = print_params(parameter_equalize, 'equalize', prefix, verbose)
+
+        save = parameter_equalize.pop('save', None)
+        threshold = parameter_equalize.pop('threshold', None)
+
+        equalized = equalize(median, mask=mask, **parameter_equalize)
+
+        if save:
+            save = io.as_source(save)
+            save[base_slicing] = equalized[valid_slicing]
+
+        if verbose:
+            timer.print_elapsed_time('Equalization')
+
+        if threshold:
+            binary_equalized = equalized > threshold
 
             if binary_status is not None:
-                binary_status[binary_adaptive[valid_slicing]] += BINARY_STATUS['Adaptive']
+                binary_status[binary_equalized[valid_slicing]] += BINARY_STATUS['Equalized']
             else:
-                sink[valid_slicing] += binary_adaptive[valid_slicing]
+                sink[valid_slicing] += binary_equalized[valid_slicing]
 
-            del binary_adaptive, adaptive
+            # prepare equalized for use in vesselization
+            parameter_vesselization = parameter.get('vesselize')
+            if parameter_vesselization and parameter_vesselization.get('background'):
+                equalized[binary_equalized] = threshold
+                equalized = float(max_bin - 1) / threshold * equalized
 
-            # if verbose:
-            #     timer.print_elapsed_time('Adaptive')
-
-        del deconvolved
-        # active arrays: median, mask
-
-        # equalize
-        parameter_equalize = parameter.get('equalize')
-        if parameter_equalize:
-            parameter_equalize, timer = print_params(parameter_equalize, 'equalize', prefix, verbose)
-
-            save = parameter_equalize.pop('save', None)
-            threshold = parameter_equalize.pop('threshold', None)
-
-            equalized = equalize(median, mask=mask, **parameter_equalize)
-
-            if save:
-                save = io.as_source(save)
-                save[base_slicing] = equalized[valid_slicing]
+            del binary_equalized
 
             if verbose:
-                timer.print_elapsed_time('Equalization')
+                timer.print_elapsed_time('Equalization: binarization')
+    else:
+        equalized = median
+    del median
+    # active arrays: equalized, mask
 
-            if threshold:
-                binary_equalized = equalized > threshold
+    # smaller vessels /capillaries
+    parameter_vesselization = parameter.get('vesselize')
+    if parameter_vesselization:
+        parameter_vesselization, timer = print_params(parameter_vesselization, 'vesselize', prefix, verbose)
 
-                if binary_status is not None:
-                    binary_status[binary_equalized[valid_slicing]] += BINARY_STATUS['Equalized']
-                else:
-                    sink[valid_slicing] += binary_equalized[valid_slicing]
+        parameter_background = parameter_vesselization.get('background')
+        parameter_background = parameter_background.copy()
+        if parameter_background:
+            save = parameter_background.pop('save', None)
 
-                # prepare equalized for use in vesselization
-                parameter_vesselization = parameter.get('vesselize')
-                if parameter_vesselization and parameter_vesselization.get('background'):
-                    equalized[binary_equalized] = threshold
-                    equalized = float(max_bin-1) / threshold * equalized
+            equalized = np.array(equalized, dtype='uint16')
+            background = rnk.percentile(equalized, max_bin=max_bin, mask=mask, **parameter_background)
+            tubeness = equalized - np.minimum(equalized, background)
 
-                del binary_equalized
+            del background
 
-                if verbose:
-                    timer.print_elapsed_time('Equalization: binarization')
-        else:
-            equalized = median
-
-        del median
-        # active arrays: mask, equalized
-
-        # smaller vessels /capillaries
-        parameter_vesselization = parameter.get('vesselize')
-        if parameter_vesselization:
-            parameter_vesselization, timer = print_params(parameter_vesselization, 'vesselize', prefix, verbose)
-
-            parameter_background = parameter_vesselization.get('background')
-            parameter_background = parameter_background.copy()
-            if parameter_background:
-                save = parameter_background.pop('save', None)
-
-                equalized = np.array(equalized, dtype='uint16')
-                background = rnk.percentile(equalized, max_bin=max_bin, mask=mask, **parameter_background)
-                tubeness = equalized - np.minimum(equalized, background)
-
-                del background
-
-                if save:
-                    save = io.as_source(save)
-                    save[base_slicing] = tubeness[valid_slicing]
-            else:
-                tubeness = equalized
-
-            parameter_tubeness = parameter_vesselization.get('tubeness', {})
-            tubeness = tubify(tubeness, **parameter_tubeness)
-
-            save = parameter_vesselization.get('save')
             if save:
                 save = io.as_source(save)
                 save[base_slicing] = tubeness[valid_slicing]
+        else:
+            tubeness = equalized
 
-            if verbose:
-                timer.print_elapsed_time('Vesselization')
+        parameter_tubeness = parameter_vesselization.get('tubeness', {})
+        tubeness = tubify(tubeness, **parameter_tubeness)
 
-            threshold = parameter_vesselization.get('threshold')
-            if threshold:
-                binary_vesselized = tubeness > threshold
-
-                if binary_status is not None:
-                    binary_status[binary_vesselized[valid_slicing]] += BINARY_STATUS['Tube']
-                else:
-                    sink[valid_slicing] += binary_vesselized[valid_slicing]
-
-                del binary_vesselized
-
-                if verbose:
-                    timer.print_elapsed_time('Vesselization: binarization')
-
-            del tubeness
-
-        del equalized, mask
-        # active arrays: None
-
-
-        # smooth binary
-        if parameter.get('smooth'):  # WARNING: otherwise removes sink if no smoothing
-            parameter['smooth']['save'] = False
-            smoothed = run_step('smooth', sink, bs.smooth_by_configuration, remove_previous_result=False,
-                                extra_kwargs={'sink': None, 'processes': 1}, **default_step_params)
-            sink[valid_slicing] = smoothed[valid_slicing]
-            del smoothed
+        save = parameter_vesselization.get('save')
+        if save:
+            save = io.as_source(save)
+            save[base_slicing] = tubeness[valid_slicing]
 
         if verbose:
-            total_time.print_elapsed_time('Binarization')
+            timer.print_elapsed_time('Vesselization')
+
+        threshold = parameter_vesselization.get('threshold')
+        if threshold:
+            binary_vesselized = tubeness > threshold
+
+            if binary_status is not None:
+                binary_status[binary_vesselized[valid_slicing]] += BINARY_STATUS['Tube']
+            else:
+                sink[valid_slicing] += binary_vesselized[valid_slicing]
+
+            del binary_vesselized
+
+            if verbose:
+                timer.print_elapsed_time('Vesselization: binarization')
+
+        del tubeness
+
+    del equalized, mask
+    # active arrays: None
+
+    if verbose:
+        total_time.print_elapsed_time('Binarization')
 
     gc.collect()
 
@@ -923,56 +873,38 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
 
     mask = np.logical_not(np.logical_or(low, high))
     clipped -= clip_low
-    clipped *= float(norm-1) / (clip_high - clip_low)
+    clipped *= float(norm - 1) / (clip_high - clip_low)
     clipped = np.asarray(clipped, dtype=dtype)
     return clipped, mask, high, low
 
-def clip_log(source, clip_range, scaling_factor, norm=MAX_BIN, dtype=DTYPE):
-    """
-    1) Build masks based on clip ranges
-    2) Apply a log
-    3) Normalize the image to MAX_BIN
 
-    N.B: The lower the scaling_factor the stronger the vessels signals and the less permissive the segmentation.
-    Consider lowering it if too much noise.
-    Consider raising it if it is not capturing enough.
-    """
-    logged = np.array(source[:], dtype=dtype)
-    clip_low, clip_high = clip_range
-    low = logged < clip_low
-    high = logged > clip_high
-    logged[low] = 0
-    mask = np.logical_not(np.logical_or(low, high))
-    logged = np.log1p(scaling_factor * (logged / np.max(logged)).astype(float))
-    logged *= float(norm - 1) / (np.max(logged) - np.min(logged) + 1e-8)
-    logged = np.asarray(logged, dtype=dtype)
-    return logged, high, low, mask
+def adjust_gamma(source, gamma=0.45, gain=1):
+    if gamma < 0:
+        raise ValueError("Gamma should be a non-negative real number.")
 
-def preprocess_snake(source, log_instead_of_clip, mask, not_low):
+    dtype = source.dtype.type
+    scale = float(np.max(source) - np.min(source))
+    out = (((source / scale) ** gamma) * scale * gain).astype(dtype)
+
+    return out
+
+def remove_background(source, mask, not_low, sigma, sigma_mask):
     """Selective background subtraction by masked gaussian difference (normalized convolution)."""
-    if not log_instead_of_clip:
-        gamma_adjusted = adjust_gamma(source, 1.5) # compensate for clipping
-    else:
-        gamma_adjusted = source
-
-    smoothed = np.zeros_like(gamma_adjusted)
-    smoothed[mask] = gamma_adjusted[mask]
-    smoothed = ndi.gaussian_filter(smoothed, sigma=(13, 13, 13))
-    norm = ndi.gaussian_filter(not_low.astype(float), sigma=(13, 13, 13))
+    smoothed = np.zeros_like(source)
+    smoothed[mask] = source[mask]
+    smoothed = ndi.gaussian_filter(smoothed, sigma=sigma)
+    norm = ndi.gaussian_filter(not_low.astype(float), sigma=sigma_mask)
     norm[norm == 0] = 1e-8
 
     background = smoothed / norm
-    bg_subtracted = gamma_adjusted - np.minimum(gamma_adjusted, background)
-    background[~not_low] = 0
-
+    bg_subtracted = source - np.minimum(source, background)
 
     return bg_subtracted.astype(np.uint16)
 
-def postprocess_snake(source, mask, small_objects_removal):
+def postprocess_snake(source, mask):
     """
     1) Check foreground/background labeling and inverts it if needed.
     2) Remove small dots (morphACWE artifacts)
-    2b) Optionally remove small objects if small_objects_removal=True
     """
     if (source.sum() / mask.sum()) > 0.5:
         source = np.logical_and(np.logical_not(source), mask)
@@ -980,13 +912,12 @@ def postprocess_snake(source, mask, small_objects_removal):
     post_snake = np.zeros(source.shape, dtype=bool)
     post_snake[:] = source[:]
 
-    min_size = 70 if small_objects_removal else 4
-
     for z in range(post_snake.shape[0]):
         # TODO check if this is really needed. Can smooth_by_configuration do it ?
-        post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=min_size)
+        post_snake[z, :, :] = remove_small_objects(post_snake[z, :, :], min_size=4)
 
     return post_snake
+
 
 def deconvolve(source, binarized, sigma=10):
     convolved = np.zeros(source.shape, dtype=float)
@@ -1023,12 +954,13 @@ def equalize(source, percentile=(0.5, 0.95), max_value=1.5, selem=(200, 200, 5),
              interpolate=1, mask=None):
     equalized = ls.local_percentile(source, percentile=percentile, mask=mask, dtype=float,
                                     selem=selem, spacing=spacing, interpolate=interpolate)
-    normalize = 1/np.maximum(equalized[..., 0], 1)
+    normalize = 1 / np.maximum(equalized[..., 0], 1)
     maxima = equalized[..., 1]
     ids = maxima * normalize > max_value
     normalize[ids] = max_value / maxima[ids]
     equalized = np.array(source, dtype=float) * normalize
     return equalized
+
 
 def tubify(source, sigma=1.0, gamma12=1.0, gamma23=1.0, alpha=0.25):
     return hes.lambda123(source=source, sink=None, sigma=sigma, gamma12=gamma12, gamma23=gamma23, alpha=alpha)
@@ -1040,10 +972,12 @@ def apply_remove_holes_block(arr, axis, start, end, area_threshold):
     slc = tuple(slicer)
     arr[slc] = remove_holes(arr[slc], area_threshold=area_threshold)
 
+
 def remove_holes(arr, area_threshold, connectivity=1):
     inv = ~arr
     filled = remove_small_objects(inv, min_size=area_threshold, connectivity=connectivity)
     return ~(filled > 0)
+
 
 def apply_remove_holes_along_axis(arr, axis, step, area_threshold, processes):
     size = arr.shape[axis]
@@ -1059,16 +993,18 @@ def apply_remove_holes_along_axis(arr, axis, step, area_threshold, processes):
 
     return arr
 
+
 def slice_filling(source, step=4, processes=10):
     # step=4 avoids filling loops
     filled = source
 
     for axis in range(3):
         size_slice = filled.shape[(axis + 1) % 3] * filled.shape[(axis + 2) % 3]
-        area_threshold = size_slice // 6 #TODO find something else than 6.
+        area_threshold = size_slice // 6  # TODO find something else than 6.
         filled = apply_remove_holes_along_axis(filled, axis, step, area_threshold, processes)
 
     return filled
+
 
 ###############################################################################
 # ## Helper

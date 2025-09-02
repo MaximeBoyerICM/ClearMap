@@ -261,22 +261,25 @@ class BinaryVesselProcessor(TabProcessor):
         binarization_parameter = copy.deepcopy(vasculature.default_binarization_parameter)
         binarization_cfg = self.processing_config['binarization'][channel]
         binarization_parameter['clip']['clip_range'] = binarization_cfg['binarize']['clip_range']
-        binarization_parameter['log']['clip_range'] = binarization_cfg['binarize']['clip_range']
-        binarization_parameter['log']['scaling_factor'] = binarization_cfg['binarize']['alpha']
-        # for step in binarization_parameter.keys():
-        #     if isinstance(binarization_parameter[step], dict) and step in ["log", "lightsheet", "median"]:
-        #         binarization_parameter[step]['save'] = sink.parent / f"inter_{step}_{channel}.npy"
+        binarization_parameter['gamma']['gamma'] = binarization_cfg['binarize']['gamma']
 
         deconvolve_threshold = binarization_cfg['binarize']['threshold']
         if deconvolve_threshold is not None:
             binarization_parameter['deconvolve']['threshold'] = deconvolve_threshold
 
         if channel != self.all_vessels_channel:  # For arteries or veins
-            binarization_parameter.update(equalize=None, vesselize=None)
+            binarization_parameter.update(lightsheet_correction=None,
+                                          gamma=None, adaptive=None,
+                                          equalize=None, vesselize=None)
             processing_parameter = copy.deepcopy(vasculature.default_binarization_processing_parameter)
-            processing_parameter["axes"]=[0, 2]  # WARNING temporary solution to avoid segmenting striatum
+            processing_parameter["axes"]=[0, 2]
+            if binarization_cfg['binarize']['autof_subtraction']:
+                pass  # TODO subtract autofluoresence
         else:
+            binarization_parameter.update(ligthsheet_correction=None, snake=None,
+                                          equalize=None, vesselize=None)
             processing_parameter = copy.deepcopy(vasculature.default_binarization_processing_parameter)
+
         processing_parameter.update(processes=self.machine_config['n_processes_binarization'],
                                     as_memory=True, verbose=True)
 
