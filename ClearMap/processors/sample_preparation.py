@@ -20,6 +20,7 @@ from configobj import ConfigObj
 
 from ClearMap.IO.assets_constants import CONTENT_TYPE_TO_PIPELINE
 from ClearMap.Utils.exceptions import MissingRequirementException, ClearMapAssetError, ParamsOrientationError
+from ClearMap.Utils.tag_expression import Expression
 from ClearMap.gui.gui_utils import surface_project, setup_mini_brain
 
 matplotlib.use('Qt5Agg')
@@ -345,6 +346,22 @@ class SampleManager(TabProcessor):
         if asset.exists:
             asset.delete()
 
+    def get_channel_resolution(self, channel):
+        """
+        Get the resolution of the channel as defined in the sample config.
+
+        Parameters
+        ----------
+        channel : str
+            The channel to get the resolution for
+
+        Returns
+        -------
+        tuple(float, float, float)
+            The resolution of the channel in (x, y, z) format
+        """
+        return tuple(self.config['channels'][channel]['resolution'])
+
     def stitched_shape(self, channel):
         asset = self.get('stitched', channel=channel, sample_id=self.prefix)
         if asset.exists:
@@ -586,7 +603,7 @@ class RegistrationProcessor(TabProcessor):
         for channel in self.config['channels']:
             if self.config['channels'][channel]['align_with'] is None:
                 continue
-            if self.config['channels'][channel]['moving_channel'] in (None, 'intrinsically aligned'):
+            if self.config['channels'][channel]['moving_channel'] in (None, 'intrinsically_aligned'):
                 continue
             for asset_type in ('fixed_landmarks', 'moving_landmarks', 'aligned'):
                 try:
@@ -771,7 +788,7 @@ class RegistrationProcessor(TabProcessor):
     def align_channel(self, channel):
         self.config.reload()
         fixed_channel, moving_channel = self.get_fixed_moving_channels(channel)
-        if moving_channel is None or moving_channel == 'intrinsically aligned':
+        if moving_channel is None or moving_channel == 'intrinsically_aligned':
             return
         channel_cfg = self.config['channels'][channel]
         run_bspline = any(['bspline' in channel_cfg['params_files']])
@@ -1205,7 +1222,10 @@ class StitchingProcessor(TabProcessor):
                 self.get('raw', channel=channel).file_list[0], rigid_cfg).as_source()
         extension = '.npy' if self.sample_manager.use_npy(channel) else None  # TODO: optional requires
         raw_expr = str(self.get_path('raw', channel=channel, extension=extension))
-        layout = stitching_wobbly.WobblyLayout(expression=raw_expr, tile_axes=('X', 'Y'), overlaps=overlaps)
+        tag_names = tuple(sorted(Expression(raw_expr).tag_names()))  # sort alphabetically to ensure consistent order
+        # Drop irrelevant axes if e.g. scanning only rows or columns
+        overlaps = [overlap for name, overlap in zip(('X', 'Y'), overlaps) if name in tag_names]
+        layout = stitching_wobbly.WobblyLayout(expression=raw_expr, tile_axes=tag_names, overlaps=overlaps)
         return layout
 
     @property

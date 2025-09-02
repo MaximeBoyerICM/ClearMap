@@ -14,6 +14,7 @@ import functools
 import platform
 import warnings
 import gc
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -38,7 +39,7 @@ import ClearMap.ImageProcessing.Skeletonization.Skeletonization as skeletonizati
 import ClearMap.ImageProcessing.Binary.Filling as binary_filling
 
 import ClearMap.Analysis.Measurements.MeasureExpression as measure_expression
-import ClearMap.Analysis.Measurements.MeasureRadius as measure_radius
+import ClearMap.Analysis.Measurements.radius_measurements as measure_radius
 from ClearMap.Analysis.graphs import graph_processing
 import ClearMap.Analysis.Measurements.Voxelization as voxelization
 
@@ -75,7 +76,7 @@ class VesselGraphProcessorSteps(ProcessorSteps):
         return self.graph_raw, self.graph_cleaned, self.graph_reduced, self.graph_annotated  # TODO: add traced
 
     def asset_from_step_name(self, step):
-        return self.workspace.get('graph', asset_sub_type=step)
+        return self.workspace.get('graph', channel=self.channel, asset_sub_type=step)
 
 
 class BinaryVesselProcessorSteps(ProcessorSteps):
@@ -83,14 +84,16 @@ class BinaryVesselProcessorSteps(ProcessorSteps):
         super().__init__(workspace, channel=channel, sub_step=sub_step)
         self.stitched = 'stitched'
         self.binary = 'binary'
-        self.postprocessed = 'postprocessed'
+        # self.postprocessed = 'postprocessed'
+        self.smoothed = 'smoothed'
+        self.deep_filled = 'deep_filled'
         self.filled = 'filled'
         self.combined = 'combined'
         self.final = 'final'
 
     @property
     def steps(self):
-        return self.stitched, self.binary, self.postprocessed, self.filled, self.combined, self.final
+        return self.stitched, self.binary, self.smoothed, self.deep_filled, self.filled, self.combined, self.final
 
     def asset_from_step_name(self, step):  # FIXME: split step and substep
         if step in (self.stitched, self.binary):
@@ -113,7 +116,9 @@ class BinaryVesselProcessor(TabProcessor):
     def __init__(self, sample_manager=None):
         super().__init__()
         self.inputs_match = False
-        self.postprocessing_tmp_params = None
+
+        # asset parameters for the postprocessing step that was run last
+        self.postprocessing_last_step = {}  # {'ch0': {'source': None, 'temp_path': '', 'keep': True}}
         self.sample_config = None
         self.processing_config = None
         self.machine_config = None
@@ -162,7 +167,7 @@ class BinaryVesselProcessor(TabProcessor):
 
             compound_channel = tuple(self.channels_to_binarize())
             if compound_channel not in self.workspace.asset_collections.keys():  # FIXME: could be string version
-                sample_id = self.sample_manager.config['sample_id']
+                sample_id = self.sample_manager.config['sample_id'] if self.sample_config['use_id_as_prefix'] else None
                 self.workspace.add_channel(ChannelSpec(compound_channel, 'compound'), sample_id=sample_id)
                 self.workspace.add_pipeline('TubeMap', compound_channel, sample_id=sample_id)
 
@@ -237,11 +242,11 @@ class BinaryVesselProcessor(TabProcessor):
 
     @setup_channel_operation
     def smooth_channel(self, channel):
-        self.smooth(channel)  # TODO: update watcher
+        self._smooth(channel)  # TODO: update watcher
 
     @setup_channel_operation
     def fill_channel(self, channel):  # WARNING: should run from main thread
-        self.fill(channel)  # TODO: update watcher
+        self._fill(channel)  # TODO: update watcher
 
     @setup_channel_operation
     def deep_fill_channel(self, channel):  # n_blocks because of decorator
@@ -281,6 +286,9 @@ class BinaryVesselProcessor(TabProcessor):
             processing_parameter = copy.deepcopy(vasculature.default_binarization_processing_parameter)
 
         processing_parameter.update(processes=self.machine_config['n_processes_binarization'],
+                                    overlap=self.machine_config['detection_chunk_overlap'],
+                                    size_max=self.machine_config['detection_chunk_size_max'],
+                                    size_min=self.machine_config['detection_chunk_size_min'],
                                     as_memory=True, verbose=True)
 
         vasculature.binarize(source, sink,
@@ -298,60 +306,67 @@ class BinaryVesselProcessor(TabProcessor):
                          arrange=arrange, lut=self.machine_config['default_lut'], parent=parent)
         return dvs
 
-    def smooth(self, channel):
+    def __get_post_processing_source(self, channel, step):
+        if channel not in self.postprocessing_last_step:
+            self.postprocessing_last_step[channel] = {'source': None, 'temp_path': '', 'keep': True}
+        src = self.postprocessing_last_step[channel]['source']
+        previous_step_path = (self.steps[channel].get_asset(step, step_back=True, n_before=1)).path
+        return src or previous_step_path  #  self.get_path('binary', channel=channel)
+
+    def _smooth(self, channel):
         binarization_cfg = self.processing_config['binarization'][channel]
-        run_smoothing = binarization_cfg['smooth']['run']
-        run_filling = binarization_cfg['binary_fill']['run']
+        if not binarization_cfg['smooth']['run']:
+            return
 
-        self.steps[channel].remove_next_steps_files(self.steps[channel].postprocessed)  # TODO: do we keep ?
+        self.steps[channel].remove_next_steps_files(self.steps[channel].smoothed)
 
-        source = self.workspace.source('binary', channel=channel)
-        sink = self.get_path('binary', channel=channel, asset_sub_type='postprocessed')
+        source = self.__get_post_processing_source(channel, 'smoothed')
+        sink = self.get_path('binary', channel=channel, asset_sub_type='smoothed')
         sink = initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
 
-        params = copy.deepcopy(vasculature.default_postprocessing_processing_parameter)
-        params.update(size_max=50)
-
-        postprocessing_parameter = copy.deepcopy(vasculature.default_postprocessing_parameter)
-        if not run_smoothing:
-            postprocessing_parameter.update(smooth=False)
-        postprocessing_parameter.update(fill=run_filling)
-
-        fill_source, tmp_f_path, save = vasculature.apply_smoothing(source, sink, params, postprocessing_parameter,
-                                                                    processes=None, verbose=True)
-        self.postprocessing_tmp_params = {'fill_source': fill_source, 'tmp_path': tmp_f_path, 'save': save}
-
-        # vasculature.postprocess(source, sink, processing_parameter=params,
-        #                         postprocessing_parameter=postprocessing_parameter,
-        #                         processes=None, verbose=True)  # WARNING: prange if filling
-
-    def fill(self, channel):
-        binarization_cfg = self.processing_config['binarization'][channel]
-        run_smoothing = binarization_cfg['smooth']['run']
-        sink = self.get_path('binary', channel=channel, asset_sub_type='postprocessed')
-        if not run_smoothing and os.path.exists(sink):  # FIXME: cannot assume, should prompt (or use separate files)
-            source = sink  # We assume the smoothing ran previously, hence source is previous postprocessed
+        if binarization_cfg['smooth']['run']:
+            smoothing_parameters = copy.deepcopy(vasculature.default_postprocessing_parameter['smooth'])
         else:
-            if self.postprocessing_tmp_params is not None:
-                source = self.postprocessing_tmp_params['fill_source']
-            else:
-                source = self.get_path('binary', channel=channel, asset_sub_type='postprocessed')
+            smoothing_parameters = {}
+
+        perf_params = copy.deepcopy(vasculature.default_postprocessing_processing_parameter)
+        perf_params.update(size_max=50)
+        smoothed, tmp_f_path = vasculature.apply_smoothing(source, sink, smoothing_parameters, perf_params,
+                                                           processes=None, verbose=True)
+
+        self.postprocessing_last_step[channel] = {'source': smoothed, 'temp_path': tmp_f_path,
+                                                  'keep': smoothing_parameters.get('save', False)}
+
+    def _fill(self, channel):
+        if not self.processing_config['binarization'][channel]['binary_fill']['run']:
+            return
+        source = self.__get_post_processing_source(channel, 'filled')
+        sink = self.get_path('binary', channel=channel, asset_sub_type='filled')
+
+        self.steps[channel].remove_next_steps_files(self.steps[channel].filled)
 
         source = clearmap_io.as_source(source)
         sink = initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
 
         binary_filling.fill(source, sink=sink, processes=None, verbose=True)  # WARNING: prange if filling
-        if run_smoothing and not self.postprocessing_tmp_params['save']:
-            clearmap_io.delete_file(self.postprocessing_tmp_params['tmp_path'])
+        if self.postprocessing_last_step[channel]['tmp_path'] and not self.postprocessing_last_step[channel]['keep']:
+            clearmap_io.delete_file(self.postprocessing_last_step[channel]['tmp_path'])
+
+        self.postprocessing_last_step[channel] = {'source': sink, 'temp_path': '', 'keep': False}
 
     def __deep_fill_channel(self, channel, size_max=None, overlap=None, resample_factor=None):
+        binary_cfg = self.processing_config['binarization'][channel]
+        if not binary_cfg['deep_fill']['run']:
+            return
+
         REQUIRED_V_RAM = 22000  # TODO: put in config at top of module
         if size_max is None:
-            size_max = self.processing_config['binarization'][channel]['deep_fill']['size_max']
+            size_max = binary_cfg['deep_fill']['size_max']
         if overlap is None:
-            overlap = self.processing_config['binarization'][channel]['deep_fill']['overlap']
+            overlap = binary_cfg['deep_fill']['overlap']
         if resample_factor is None:
-            resample_factor = self.processing_config['binarization'][channel]['deep_fill']['resample_factor']
+            resample_factor = binary_cfg['deep_fill']['resample_factor']
+
         if not get_free_v_ram() > REQUIRED_V_RAM:
             btn = warning_popup(f'Insufficient VRAM',
                                 f'You do not have enough free memory on your graphics card to '
@@ -362,10 +377,11 @@ class BinaryVesselProcessor(TabProcessor):
             elif btn == QDialogButtonBox.Retry:
                 self.__deep_fill_channel(channel, size_max, overlap, resample_factor)
 
-        self.steps[channel].remove_next_steps_files(self.steps[channel].filled)
+        self.steps[channel].remove_next_steps_files(self.steps[channel].deep_filled)
 
-        source = self.get_path('binary', channel=channel, asset_sub_type='postprocessed')
-        sink = self.get_path('binary', channel=channel, asset_sub_type='filled')
+        # TODO: check how source casts to bool
+        source = self.__get_post_processing_source(channel, 'deep_filled')
+        sink = self.get_path('binary', channel=channel, asset_sub_type='deep_filled')
 
         processing_parameter = copy.deepcopy(vessel_filling.default_fill_vessels_processing_parameter)
         processing_parameter.update(size_max=size_max, size_min='fixed', axes='all', overlap=overlap)
@@ -375,6 +391,8 @@ class BinaryVesselProcessor(TabProcessor):
         gc.collect()
         clear_cuda_cache()
 
+        self.postprocessing_last_step[channel] = {'source': sink, 'temp_path': '', 'keep': False}
+
     def combine_binary(self):
         """Merge the binary images of the different vascular network components into a single mask"""
         # FIXME: probably missing the call to workspace.add_channel(self.channels_to_binarize())
@@ -382,11 +400,14 @@ class BinaryVesselProcessor(TabProcessor):
         if len(self.channels_to_binarize()) > 1:
             sources = []
             for channel in self.channels_to_binarize():
-                asset = self.steps[channel].get_asset(self.steps[channel].filled, step_back=True)
-                if asset.exists:
-                    sources.append(asset.path)
+                if self.postprocessing_last_step[channel]['source']:
+                    sources.append(self.postprocessing_last_step[channel]['source'])
                 else:
-                    raise FileNotFoundError(f'File {asset.path} not found')
+                    asset = self.steps[channel].get_asset(self.steps[channel].filled, step_back=True)
+                    if asset.exists:
+                        sources.append(asset.path)
+                    else:
+                        raise FileNotFoundError(f'File {asset.path} not found')
             block_processing.process(np.logical_or, sources, sink_asset.path,
                                      size_max=500, overlap=0, processes=None, verbose=True)
         else:  # We expect to have at least all_vessels_channel
@@ -395,8 +416,9 @@ class BinaryVesselProcessor(TabProcessor):
             clearmap_io.copy_file(source, sink_asset.path)
 
         self.post_process_binary_combined()
-        sink_asset.compress()
-
+        if self.processing_config['binarization']['combined'].get('compress'):
+            with ProcessPoolExecutor(max_workers=1) as executor:  # Send to separate process to avoid blocking
+                executor.submit(sink_asset.compress, algorithm='bz2')
 
     def post_process_binary_combined(self):
         """Postprocess the combined binary image (typically smooth and fill)"""
@@ -477,16 +499,17 @@ class VesselGraphProcessor(TabProcessor):
         self.machine_config = {}
         self.sample_manager = sample_manager
         self.registration_processor = registration_processor
-        self.workspace = None
+        self.workspace = None  # set in setup
         self.steps = VesselGraphProcessorSteps(self.workspace)  # FIXME: handle skeleton
         self.setup(sample_manager, registration_processor)
         self.parent_channels = tuple([k for k in self.processing_config['binarization'].keys() if k != 'combined'])
+        self.steps.channel = self.parent_channels
         self.arteries_channel = self.sample_manager.get_channels_by_type('arteries', missing_action='ignore',
                                                                          multiple_found_action='error')
 
     def __get_graph(self, step):
         if step not in self.__graphs:
-            raise ValueError(f'Unknown graph step {step}')
+            raise ValueError(f'Unknown graph step "{step}"')
         g = self.__graphs[step]
         if g is None:
             g = self.get('graph', channel=self.parent_channels, asset_sub_type=step).read()
@@ -495,7 +518,7 @@ class VesselGraphProcessor(TabProcessor):
 
     def __set_graph(self, step, graph):
         if step not in self.__graphs:
-            raise ValueError(f'Unknown graph step {step}')
+            raise ValueError(f'Unknown graph step "{step}"')
         self.__graphs[step] = graph
 
     def save_graph(self, base_name):
@@ -568,9 +591,10 @@ class VesselGraphProcessor(TabProcessor):
             self.set_progress_watcher(self.sample_manager.progress_watcher)
 
             self.parent_channels = tuple([k for k in self.processing_config['binarization'].keys() if k != 'combined'])
+            self.steps.channel = self.parent_channels
 
             if self.parent_channels not in self.workspace.asset_collections.keys():
-                sample_id = self.sample_manager.config['sample_id']
+                sample_id = self.sample_manager.config['sample_id'] if self.sample_config['use_id_as_prefix'] else None
                 self.workspace.add_channel(ChannelSpec(self.parent_channels, 'compound'), sample_id=sample_id)
                 self.workspace.add_pipeline('TubeMap', self.parent_channels, sample_id=sample_id)
 
@@ -657,10 +681,12 @@ class VesselGraphProcessor(TabProcessor):
     def _measure_radii(self):
         coordinates = self.graph_raw.vertex_coordinates()
         source = self.get_path('binary', channel=self.parent_channels, asset_sub_type='final')
+        spacing = np.array(self.sample_manager.get_channel_resolution(self.parent_channels[0]))
         radii, indices = measure_radius.measure_radius(source, coordinates,
                                                        value=0, fraction=None, max_radius=150,
-                                                       return_indices=True, default=-1)  # WARNING: prange
-        self.graph_raw.set_vertex_radii(radii)
+                                                       return_indices=True, default=-1, scale=spacing)  # WARNING: prange
+        self.graph_raw.define_vertex_property('radius_units', radii)
+        # TODO: call measure_radius with return_radii_as_scalar=False and store vectors
 
     def _set_graph_artery_property(self, asset_type, asset_sub_type=None, suffix='', radius_shift=0):
         suffix = suffix or asset_type
@@ -681,7 +707,7 @@ class VesselGraphProcessor(TabProcessor):
         self._set_graph_artery_property('binary', asset_sub_type=['filled', 'postprocessed'])
 
     def _set_arteriness(self):
-        """'arteriness' from signal intensity"""
+        """assign 'arteriness' from signal intensity"""
         self._set_graph_artery_property('stitched', suffix='raw', radius_shift=10)
 
     def _build_graph_from_skeleton(self):  # TODO: split for requirements
@@ -689,7 +715,9 @@ class VesselGraphProcessor(TabProcessor):
             n_blocks = 100  # TBD:
             self.prepare_watcher_for_substep(n_blocks, self.build_graph_re, 'Building graph', True)
             self.steps.remove_next_steps_files(self.steps.graph_raw)
-            self.graph_raw = graph_processing.graph_from_skeleton(self.get_path('skeleton', channel=self.parent_channels),
+            skeleton_path = self.get_path('skeleton', channel=self.parent_channels)
+            spacing = self.sample_manager.get_channel_resolution(self.parent_channels[0])
+            self.graph_raw = graph_processing.graph_from_skeleton(skeleton_path, spacing=spacing, physical_units='µm',
                                                                   verbose=True)  # WARNING: main thread (prange)
             self._measure_radii()  # WARNING: main thread (prange)
             if self.use_arteries_for_graph:  # TODO: do same for veins if exists
@@ -706,10 +734,7 @@ class VesselGraphProcessor(TabProcessor):
         -------
 
         """
-        vertex_mappings = {
-            'coordinates': graph_processing.mean_vertex_coordinates,
-            'radii': np.max
-        }
+        vertex_mappings = copy.copy(graph_processing.DEFAULT_VERTEX_TO_VERTEX)
         if self.use_arteries_for_graph:
             vertex_mappings.update({
                 'artery_binary': np.max,
@@ -730,20 +755,20 @@ class VesselGraphProcessor(TabProcessor):
         def vote(expression):
             return np.sum(expression) >= len(expression) / 1.5
 
-        vertex_to_edge_mappings = vertex_to_edge_mappings or {'radii': np.max}
-        edge_to_edge_mappings = edge_to_edge_mappings or {'length': np.sum}
-        edge_geometry_vertex_properties = ['coordinates', 'radii']
+        vertex_to_edge_mappings = vertex_to_edge_mappings or graph_processing.DEFAULT_VERTEX_TO_EDGE
+        edge_to_edge_mappings = edge_to_edge_mappings
+        edge_geometry_vertex_properties = ['coordinates', 'coordinates_units', 'radii', 'length', 'chain_id', '_vertex_id_']
         if self.use_arteries_for_graph:
             vertex_to_edge_mappings.update({
                 'artery_binary': vote,
                 'artery_raw': np.max})  # TODO: do same for veins if exists
             edge_geometry_vertex_properties.extend(['artery_binary', 'artery_raw'])
         self.steps.remove_next_steps_files(self.steps.graph_reduced)
-        self.graph_reduced = graph_processing.reduce_graph(self.graph_cleaned, edge_length=True,
-                                                           edge_to_edge_mappings=edge_to_edge_mappings,
+        self.graph_reduced = graph_processing.reduce_graph(self.graph_cleaned,
                                                            vertex_to_edge_mappings=vertex_to_edge_mappings,
+                                                           edge_to_edge_mappings=edge_to_edge_mappings,
+                                                           compute_edge_length=True,
                                                            edge_geometry_vertex_properties=edge_geometry_vertex_properties,
-                                                           edge_geometry_edge_properties=None,
                                                            return_maps=False, verbose=True)
         self.save_graph('reduced')
 
@@ -1156,8 +1181,8 @@ class VesselGraphProcessor(TabProcessor):
         if graph_step in self.steps.existing_steps:
             graph = getattr(self, f'graph_{graph_step}')
         else:
-            raise ValueError(f'graph step {graph_step} not recognised, '
-                             f'available steps are {self.steps.existing_steps}')
+            raise ValueError(f'graph step "{graph_step}" not recognised, '
+                             f'available steps are "{self.steps.existing_steps}"')
         graph_chunk = graph.sub_slice(chunk_range)
         title = f'{graph_step.title()} Graph'
         annotator = self.registration_processor.annotators[self.parent_channels[0]]

@@ -788,7 +788,7 @@ class RegistrationTab(PreProcessingTab):
         page_widget.alignWithComboBox.clear()
         page_widget.alignWithComboBox.addItems([None, 'atlas'] + other_channels)
         page_widget.movingChannelComboBox.clear()
-        page_widget.movingChannelComboBox.addItems([None, 'atlas', 'intrinsically aligned'] + other_channels + [channel])
+        page_widget.movingChannelComboBox.addItems([None, 'atlas', 'intrinsically_aligned'] + other_channels + [channel])
         channel_dtype = self.sample_manager.config['channels'][channel]['data_type']
         print(f'Configuring alignment partners for {channel=}, {channel_dtype=}, {partner_channel=}')
         if not partner_channel or partner_channel == channel:
@@ -836,9 +836,9 @@ class RegistrationTab(PreProcessingTab):
             self.wrap_step('Setting up atlas', self.setup_atlas, n_steps=1, save_cfg=False, nested=False)  # TODO: abort_func=self.aligner.stop_process
 
     # def handle_layout_channel_changed(self, channel, layout_channel):
-    #    """To select automatically "intrinsically aligned" if 2 channels have same stitching layout"""
+    #    """To select automatically "intrinsically_aligned" if 2 channels have same stitching layout"""
     #     self.params[channel].align_with = layout_channel
-    #     self.params[channel].moving_channel = 'intrinsically aligned'
+    #     self.params[channel].moving_channel = 'intrinsically_aligned'
     #     self.params[channel].cfg_to_ui()  # Update the UI to reflect the changes
 
     def set_progress_watcher(self, watcher):
@@ -1370,7 +1370,7 @@ class VasculatureTab(PostProcessingTab):
     def _set_channels_names(self):
         if self.params.config['is_default']:
             self.params.fix_default_config()
-        for channel in self.sample_manager.get_channels_by_pipeline('TubeMap'):  # TODO: see if shouldn't be handled by params instead
+        for channel in self.sample_manager.get_channels_by_pipeline('TubeMap', as_list=True):  # TODO: see if shouldn't be handled by params instead
             channel_type = self.sample_manager.get_channel_type(channel)
             if channel not in self.params.config['binarization'].keys():
                 self.params.patch_config_section(channel, channel_type)
@@ -1445,7 +1445,7 @@ class VasculatureTab(PostProcessingTab):
     #     pass
 
     def _get_channels(self):
-        return self.sample_manager.get_channels_by_pipeline('TubeMap')
+        return self.sample_manager.get_channels_by_pipeline('TubeMap', as_list=True)
 
     def _set_channel_config(self, channel):
         self.params[channel]._config = self.params.config
@@ -1547,11 +1547,11 @@ class VasculatureTab(PostProcessingTab):
                            step_args=[channel], abort_func=self.binary_vessel_processor.stop_process)
             self.wrap_step('Vessel binarization', self.binary_vessel_processor.smooth_channel,
                            step_args=[channel], abort_func=self.binary_vessel_processor.stop_process)
+            self.wrap_step('Vessel binarization', self.binary_vessel_processor.deep_fill_channel,
+                           step_args=[channel], abort_func=self.binary_vessel_processor.stop_process)
             self.wrap_step('Vessel binarization', self.binary_vessel_processor.fill_channel,
                            step_args=[channel], abort_func=self.binary_vessel_processor.stop_process,
                            main_thread=True)  # WARNING: The parallel cython loops inside cannot run from child thread
-            self.wrap_step('Vessel binarization', self.binary_vessel_processor.deep_fill_channel,
-                           step_args=[channel], abort_func=self.binary_vessel_processor.stop_process)
         except ClearMapVRamException as err:
             if stop_on_error:
                 raise err
@@ -2146,7 +2146,7 @@ class GroupAnalysisProcessor:
             gp1, gp2 = [groups[gp_name] for gp_name in pair]
             for channel in channels:
                 _ = density_files_are_comparable(self.results_folder, gp1, gp2, channel,
-                                                 density_file_suffix=density_files_suffix)
+                                                 density_files_suffix=density_files_suffix)
             check_ids_are_unique(gp1, gp2)
             # compare_groups is automatically for each channel (loads the first sample to find the channels)
             wrapping_func(compare_groups, self.results_folder, gp1_name, gp2_name, gp1, gp2,
@@ -2168,13 +2168,14 @@ class GroupAnalysisProcessor:
             dvs.append(browser)
         return dvs
 
-    def plot_density_maps(self, group_folders, channel, parent=None):
+    def plot_density_maps(self, group_folders, channel, density_suffix, parent=None):
         density_map_paths = []
         titles = []
         for folder in group_folders:
             sample_manager = SampleManager()
             sample_manager.setup(src_dir=folder)
-            map_path = sample_manager.get('density', channel=channel, asset_sub_type='counts').path
+            map_path = sample_manager.get('density', channel=channel,
+                                          suffix=density_suffix).path
             density_map_paths.append(map_path)  # TODO: make work for tubemap too
             titles.append(sample_manager.config['sample_id'])
         luts = ['flame'] * len(density_map_paths)
@@ -2224,7 +2225,7 @@ class GroupAnalysisTab(BatchTab):
                 self.params.plot_density_maps_buttons[i].clicked.connect(
                     functools.partial(self.plot_density_maps, gp))
 
-    def get_analysable_channels(self):
+    def get_analysable_channels(self):  # FIXME: move to params
         """
         List the channels that have density maps available for analysis
 
@@ -2240,8 +2241,9 @@ class GroupAnalysisTab(BatchTab):
         sample_manager.setup(src_dir=self.params.get_all_paths()[0][0])
 
         analysable_channels = []
-        for channel in sample_manager.channels:
-            asset = sample_manager.get('density', channel=channel, asset_sub_type='counts', default=None)
+        for channel in sample_manager.channels:  # FIXME:
+            asset = sample_manager.get('density', channel=channel,
+                                       suffix=self.params.density_suffix, default=None)
             if asset is not None and asset.exists:
                 analysable_channels.append(channel)
         return analysable_channels
@@ -2253,6 +2255,7 @@ class GroupAnalysisTab(BatchTab):
         self.main_window.clear_plots()  # TODO: use wrap_plot
         dvs = self.processor.plot_density_maps(self.params.groups[group_name],
                                                channel=self.params.plot_channel,
+                                               density_suffix=self.params.density_suffix,
                                                parent=self.main_window.centralWidget())
         self.main_window.setup_plots(dvs)
 

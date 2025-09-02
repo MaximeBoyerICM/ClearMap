@@ -26,14 +26,25 @@ Mapping of resource types to the folder where they are stored.
     but can be absolute paths in which case they are used as is,
     ignoring the root folder of the sample.
 """
+# RESOURCE_TYPE_TO_FOLDER = {
+#     'logs': '',  # in main folder
+#     'config_snapshots': 'config_snapshots',  # TODO: use
+#     'raw': '',  # in main folder
+#     'data': 'data',
+#     'processed': 'data',   # TODO: see if we split
+#     'results': 'analyzed',
+#     'graphs': 'graphs',  # TODO: check if analyzed/graphs
+#     'elastix': '',  # in main folder
+#     'atlas': 'atlas',
+# }
 RESOURCE_TYPE_TO_FOLDER = {
     'logs': '',  # in main folder
     'config_snapshots': 'config_snapshots',  # TODO: use
     'raw': '',  # in main folder
-    'data': 'data',
-    'processed': 'data',   # TODO: see if we split
-    'results': 'analyzed',
-    'graphs': 'graphs',  # TODO: check if analyzed/graphs
+    'data': '',
+    'processed': '',   # TODO: see if we split
+    'results': '',
+    'graphs': '',  # TODO: check if analyzed/graphs
     'elastix': '',  # in main folder
     'atlas': 'atlas',
 }
@@ -153,7 +164,7 @@ CHANNELS_ASSETS_TYPES_CONFIG = {
         'resource_type': 'results',
         'relevant_pipelines': ['TubeMap', 'AxonMap', 'TractMap'],
         'sub_types': ['status',
-                      'postprocessed', 'filled', 'combined', 'final',  # TubeMap
+                      'smoothed', 'filled', 'deep_filled', 'postprocessed', 'combined', 'final',  # TubeMap
                       'vesselize', 'median', 'pixels_raw',
                       'coordinates_transformed', 'coordinates_raw', 'labels']  # TractMap
     },

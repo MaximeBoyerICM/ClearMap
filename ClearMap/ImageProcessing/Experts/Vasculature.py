@@ -15,19 +15,18 @@ __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
   
 import gc
+import tempfile
+import warnings
 import multiprocessing
-import tempfile as tmpf
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import scipy.ndimage as ndi
-import skimage
 import skimage.filters as skif
 from skimage.morphology import remove_small_objects, remove_small_holes
-from skimage.exposure import adjust_gamma
 
 import ClearMap.IO.IO as io
-from ClearMap.Utils.exceptions import MissingRequirementException
 
 import ClearMap.ParallelProcessing.BlockProcessing as bp
 import ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing as ap
@@ -43,7 +42,7 @@ import ClearMap.ImageProcessing.Snake.morphsnake_1 as snk
 
 import ClearMap.Utils.Timer as tmr
 from ClearMap.ImageProcessing.Experts.utils import initialize_sinks, run_step, print_params
-from ClearMap.Utils.utilities import check_enough_temp_space, get_free_temp_space
+from ClearMap.Utils.utilities import get_free_temp_space, bytes_to_human
 
 ###############################################################################
 # ## Generic parameter
@@ -94,7 +93,7 @@ default_binarization_parameter = dict(
                     save=None),
 
     # median
-    median=dict(selem=((3,) * 3),
+    median=dict(selem=((3,)*3),
                 save=None),
 
     # background removal
@@ -151,7 +150,7 @@ default_binarization_processing_parameter = dict(
     optimization=True,
     optimization_fix='all',
     verbose=None,
-    processes=multiprocessing.cpu_count() - 8,
+    processes=None
 )
 """Parallel processing parameter for the vasculature binarization pipeline. 
 See :func:`ClearMap.ParallelProcessing.BlockProcessing.process`. for details."""       
@@ -162,9 +161,6 @@ default_postprocessing_parameter = dict(
 
     # binary filling
     fill=True,
-
-    # temporary file
-    temporary_filename=None
 )
 """Parameter for the postprocessing step of the binarized data.
 See :func:`postprocess` for details."""
@@ -182,7 +178,7 @@ See :func:`ClearMap.ParallelProcessing.BlockProcessing.process`. for details."""
 ###############################################################################
 # ## Binarization
 ###############################################################################
-
+                   
 def binarize(source, sink=None, binarization_parameter=default_binarization_parameter,
              processing_parameter=default_binarization_processing_parameter):
     """
@@ -198,7 +194,7 @@ def binarize(source, sink=None, binarization_parameter=default_binarization_para
         Parameter for the binarization. See below for details.
     processing_parameter : dict
         Parameter for the parallel processing.
-        See :func:`ClearMap.ParallelProcessing.BlockProcessing.process` for
+        See :func:`ClearMap.ParallelProcessing.BlockProcesing.process` for
         description of all the parameter.
 
     Returns
@@ -501,6 +497,7 @@ def binarize(source, sink=None, binarization_parameter=default_binarization_para
 
 def binarize_block(source, sink, parameter=default_binarization_parameter):
     """Binarize a Block."""
+
     # initialize parameter and slicings
     verbose = parameter.get('verbose', False)
     if verbose:
@@ -529,8 +526,8 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         parameter_clip, timer = print_params(parameter_clip, 'clip', prefix, verbose)
 
         parameter_clip.update(norm=max_bin, dtype=DTYPE)
-
         save = parameter_clip.pop('save', None)
+
         clipped, mask, high, low = clip(source, **parameter_clip)
         not_low = np.logical_not(low)
 
@@ -674,7 +671,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             parameter_vesselization = parameter.get('vesselize')
             if parameter_vesselization and parameter_vesselization.get('background'):
                 equalized[binary_equalized] = threshold
-                equalized = float(max_bin - 1) / threshold * equalized
+                equalized = float(max_bin-1) / threshold * equalized
 
             del binary_equalized
 
@@ -768,10 +765,6 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
     verbose : bool
         If True, print progress output.
 
-    Returns
-    -------
-    sink : Source
-        The result of the binarization.
 
     Notes
     -----
@@ -796,6 +789,13 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
     fill : bool or None
         If True, fill holes in the binary data.
     """
+    postprocessing_parameter = postprocessing_parameter.copy()
+    run_binary_filling = postprocessing_parameter.get('fill', False)
+    parameter_smooth = postprocessing_parameter.get('smooth')
+
+    if not run_binary_filling and not parameter_smooth:
+        warnings.warn('No postprocessing steps defined, skipping postprocessing.')
+        return
 
     source = io.as_source(source)
     sink = ap.initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
@@ -804,25 +804,19 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
         timer = tmr.Timer()
         print('Binary post processing: initialized.')
 
-    postprocessing_parameter = postprocessing_parameter.copy()
-    run_binary_filling = postprocessing_parameter.get('fill', False)
-    parameter_smooth = postprocessing_parameter.get('smooth')
-
     # smoothing
     if parameter_smooth:
-        fill_source, tmp_f_path, save = apply_smoothing(source, sink, processing_parameter, postprocessing_parameter,
-                                                        processes, verbose)
+        keep_smoothed = parameter_smooth.get('save', False)
+        fill_source, tmp_f_path = apply_smoothing(source, sink, parameter_smooth, processing_parameter,
+                                                  processes, verbose)
     else:
         fill_source = source
-        save = False
+        keep_smoothed = False
 
     if run_binary_filling:
-        if verbose:
-            timer = tmr.Timer()
-            print('Binary filling...', flush=True)
         filled = slice_filling(fill_source)
-        bf.fill(filled, sink=sink, processes=processes, verbose=verbose)
-        if parameter_smooth and not save:
+        bf.fill(fill_source, sink=sink, processes=processes, verbose=verbose)
+        if parameter_smooth and not keep_smoothed:  # FIXME: should be in a finaly block
             io.delete_file(tmp_f_path)
 
     if verbose:
@@ -831,29 +825,28 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
     gc.collect()
 
 
-def apply_smoothing(source, sink, processing_parameter, postprocessing_parameter, processes=None, verbose=True):
-    parameter_smooth = postprocessing_parameter.pop('smooth', None)
-    if postprocessing_parameter.get('fill'):
-        save = parameter_smooth.pop('save', False)
-        # initialize temporary files if needed
-        if not check_enough_temp_space():
-            raise MissingRequirementException(f'Free space in temporary directory is insufficient, required 200 GB, '
-                                              f'got {get_free_temp_space() // (2**30)} GB'
-                                              f'Please free some space or use a different temporary directory.'
-                                              f'You can set the "TMP" environment variable to a directory of your choice')
-        tmp_f_path = save if save else postprocessing_parameter['temporary_filename']
-        tmp_f_path = tmp_f_path if tmp_f_path else tmpf.mktemp(prefix='TubeMap_Vasculature_postprocessing',
-                                                               suffix='.npy')
-        sink_smooth = ap.initialize_sink(tmp_f_path, shape=source.shape, dtype=source.dtype,
-                                         order=source.order, return_buffer=False)
+def apply_smoothing(source, sink, parameter_smooth, processing_parameter, processes=None, verbose=True):
+
+    source_size = np.prod(source.shape) * source.dtype.itemsize
+
+    if parameter_smooth.get('iterations', 1) > 1:  # Try to save to temp to ensure locality if >1 iter
+        if get_free_temp_space() > source_size:
+            tmp_f_path = tempfile.mktemp(prefix='TubeMap_vasc_smooth_', suffix='.npy')
+        else:  # Default to experiment directory
+            warnings.warn(f'Free space in temporary directory is insufficient, '
+                          f'required {bytes_to_human(source_size)}, '
+                          f'got {bytes_to_human(get_free_temp_space())} '
+                          f'defaulting to experiment directory')
+            tmp_f_path = Path(source.location).parent / f'TubeMap_vasc_smooth_{source.name}.npy'
+        sink = ap.initialize_sink(tmp_f_path, shape=source.shape, dtype=source.dtype,
+                                  order=source.order, return_buffer=False)
     else:
-        sink_smooth = sink
-        save = False
         tmp_f_path = ''
+
     # run smoothing
-    fill_source = bs.smooth_by_configuration(source, sink=sink_smooth, processing_parameter=processing_parameter,
-                                             processes=processes, verbose=verbose, **parameter_smooth)
-    return fill_source, tmp_f_path, save
+    smoothed = bs.smooth_by_configuration(source, sink=sink, processing_parameter=processing_parameter,
+                                          processes=processes, verbose=verbose, **parameter_smooth)
+    return smoothed, tmp_f_path
 
 
 ###############################################################################
@@ -865,17 +858,17 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
 
     clipped = np.array(source[:], dtype=float)
 
-    low = clipped < clip_low
-    clipped[low] = clip_low
+    low_mask = clipped < clip_low
+    clipped[low_mask] = clip_low
 
-    high = clipped >= clip_high
-    clipped[high] = clip_high
+    high_mask = clipped >= clip_high
+    clipped[high_mask] = clip_high
 
-    mask = np.logical_not(np.logical_or(low, high))
+    mask = np.logical_not(np.logical_or(low_mask, high_mask))
     clipped -= clip_low
-    clipped *= float(norm - 1) / (clip_high - clip_low)
+    clipped *= float(norm-1) / (clip_high - clip_low)
     clipped = np.asarray(clipped, dtype=dtype)
-    return clipped, mask, high, low
+    return clipped, mask, high_mask, low_mask
 
 
 def adjust_gamma(source, gamma=0.45, gain=1):
