@@ -306,7 +306,7 @@ class BinaryVesselProcessor(TabProcessor):
         if channel not in self.postprocessing_last_step:
             self.postprocessing_last_step[channel] = {'source': None, 'temp_path': '', 'keep': True}
         src = self.postprocessing_last_step[channel]['source']
-        previous_step_path = (self.steps[channel].get_asset(step, step_back=True, n_before=1)).path
+        previous_step_path = self.steps[channel].get_asset(step, step_back=True, n_before=1).as_source() # WARNING maybe use clearmap_io.as_source on asset.path
         return src or previous_step_path  #  self.get_path('binary', channel=channel)
 
     def _smooth(self, channel):
@@ -345,8 +345,8 @@ class BinaryVesselProcessor(TabProcessor):
         sink = initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
 
         binary_filling.fill(source, sink=sink, processes=None, verbose=True)  # WARNING: prange if filling
-        if self.postprocessing_last_step[channel]['tmp_path'] and not self.postprocessing_last_step[channel]['keep']:
-            clearmap_io.delete_file(self.postprocessing_last_step[channel]['tmp_path'])
+        if self.postprocessing_last_step[channel]['temp_path'] and not self.postprocessing_last_step[channel]['keep']:
+            clearmap_io.delete_file(self.postprocessing_last_step[channel]['temp_path'])
 
         self.postprocessing_last_step[channel] = {'source': sink, 'temp_path': '', 'keep': False}
 
@@ -396,6 +396,8 @@ class BinaryVesselProcessor(TabProcessor):
         if len(self.channels_to_binarize()) > 1:
             sources = []
             for channel in self.channels_to_binarize():
+                if channel not in self.postprocessing_last_step:
+                    self.postprocessing_last_step[channel] = {'source': None, 'temp_path': '', 'keep': True}
                 if self.postprocessing_last_step[channel]['source']:
                     sources.append(self.postprocessing_last_step[channel]['source'])
                 else:
