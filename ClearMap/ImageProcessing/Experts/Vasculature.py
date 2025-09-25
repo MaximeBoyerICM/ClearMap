@@ -814,8 +814,8 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
         keep_smoothed = False
 
     if run_binary_filling:
-        filled = slice_filling(fill_source)
-        bf.fill(fill_source, sink=sink, processes=processes, verbose=verbose)
+        bf.slice_filling(fill_source, sink, processes=processes, verbose=verbose)
+        # bf.fill(fill_source, sink=sink, processes=processes, verbose=verbose)
         if parameter_smooth and not keep_smoothed:  # FIXME: should be in a finaly block
             io.delete_file(tmp_f_path)
 
@@ -957,47 +957,6 @@ def equalize(source, percentile=(0.5, 0.95), max_value=1.5, selem=(200, 200, 5),
 
 def tubify(source, sigma=1.0, gamma12=1.0, gamma23=1.0, alpha=0.25):
     return hes.lambda123(source=source, sink=None, sigma=sigma, gamma12=gamma12, gamma23=gamma23, alpha=alpha)
-
-
-def apply_remove_holes_block(arr, axis, start, end, area_threshold):
-    slicer = [slice(None)] * arr.ndim
-    slicer[axis] = slice(start, end)
-    slc = tuple(slicer)
-    arr[slc] = remove_holes(arr[slc], area_threshold=area_threshold)
-
-
-def remove_holes(arr, area_threshold, connectivity=1):
-    inv = ~arr
-    filled = remove_small_objects(inv, min_size=area_threshold, connectivity=connectivity)
-    return ~(filled > 0)
-
-
-def apply_remove_holes_along_axis(arr, axis, step, area_threshold, processes):
-    size = arr.shape[axis]
-    tasks = []
-
-    with ThreadPoolExecutor(max_workers=processes) as executor:
-        for start in range(0, size, step):
-            end = min(start + step, size)
-            tasks.append(executor.submit(apply_remove_holes_block, arr, axis, start, end, area_threshold))
-
-        for task in tasks:
-            task.result()
-
-    return arr
-
-
-def slice_filling(source, step=4, processes=10):
-    # step=4 avoids filling loops
-    filled = source
-
-    for axis in range(3):
-        size_slice = filled.shape[(axis + 1) % 3] * filled.shape[(axis + 2) % 3]
-        area_threshold = size_slice // 6  # TODO find something else than 6.
-        filled = apply_remove_holes_along_axis(filled, axis, step, area_threshold, processes)
-
-    return filled
-
 
 ###############################################################################
 # ## Helper

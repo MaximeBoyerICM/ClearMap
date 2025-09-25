@@ -10,6 +10,7 @@ __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
 
+
 import os
 import gc
 import multiprocessing as mp
@@ -26,6 +27,9 @@ from . import FillingCode as code
 import ClearMap.IO.IO as io
 from ClearMap.Utils.utilities import sanitize_n_processes
 import ClearMap.Utils.Timer as tmr
+import ClearMap.ParallelProcessing.BlockProcessing as bp
+
+from skimage.morphology import remove_small_objects
 
 
 #%%############################################################################
@@ -138,6 +142,56 @@ def border_indices(source):
                 border.append(indices)
     return np.concatenate(border)
 
+def fill_block(source, area_threshold=None, connectivity=1):
+    try:
+        if isinstance(source, io.src.Source):
+            filled = source.array
+        else:
+            filled = source
+
+        filled = np.asarray(filled, dtype=bool)
+
+        if area_threshold is None:
+            shape = sorted(filled.shape)
+            size_slice = shape[-1] * shape[-2]  # two largest dimensions
+            area_threshold = size_slice // 6  # TODO find something else than 6?
+
+        filled = ~filled
+        filled = remove_small_objects(filled, min_size=area_threshold, connectivity=connectivity)
+        return np.asarray(~(filled > 0), dtype=bool)
+
+    except Exception as err:
+        print(f"ERROR in fill")
+        print(err, flush=True)
+        raise
+
+def slice_filling(source, sink=None, processing_parameter=None,
+                    processes=None, verbose=False):
+
+    source = io.as_source(source)
+    sink = io.initialize(sink, shape_=source.shape, dtype_=bool, order_=source.order)
+
+    block_processing_parameter = dict(axes=bp.block_axes(source),
+                                      as_memory=True,
+                                      overlap=None,
+                                      function_type='source',
+                                      processes=processes,
+                                      verbose=verbose)
+
+    if processing_parameter is not None:
+        block_processing_parameter.update(processing_parameter)
+    if block_processing_parameter.get('overlap') is None:
+        block_processing_parameter.update({'overlap': 0})
+    if block_processing_parameter.get('size_min') is None:
+        block_processing_parameter.update({'size_min' : 4})
+    if block_processing_parameter.get('size_max') is None:
+        block_processing_parameter.update({'size_max' : 4})
+
+    for axis in range(source.ndim):
+        print(f"Filling along axis {axis}", flush=True)
+        block_processing_parameter.update({'axes': [axis]})
+        bp.process(fill_block, source, sink, **block_processing_parameter)
+        source = sink
 
 def _test():
     """Tests."""
