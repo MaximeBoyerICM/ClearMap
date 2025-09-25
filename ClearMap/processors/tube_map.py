@@ -268,10 +268,6 @@ class BinaryVesselProcessor(TabProcessor):
         binarization_parameter['clip']['clip_range'] = binarization_cfg['binarize']['clip_range']
         binarization_parameter['gamma']['gamma'] = binarization_cfg['binarize']['gamma']
 
-        deconvolve_threshold = binarization_cfg['binarize']['threshold']
-        if deconvolve_threshold is not None:
-            binarization_parameter['deconvolve']['threshold'] = deconvolve_threshold
-
         if channel != self.all_vessels_channel:  # For arteries or veins
             binarization_parameter.update(lightsheet_correction=None,
                                           gamma=None, adaptive=None,

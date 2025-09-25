@@ -97,12 +97,11 @@ default_binarization_parameter = dict(
                 save=None),
 
     # background removal
-    background_removal=dict(sigma=13,
-                            sigma_mask=15),
+    remove_bg=dict(sigma=13,
+                   sigma_mask=15),
 
     # deconvolution
     deconvolve=dict(sigma=10,
-                    threshold=750,
                     save=None),
 
      # gamma correction
@@ -111,7 +110,7 @@ default_binarization_parameter = dict(
     # snake
     snake=dict(lambda1=1.0,
                lambda2=1.0,
-               n_iter=15),
+               num_iter=15),
 
     # equalization
     equalize=dict(percentile=(0.4, 0.975),
@@ -528,26 +527,26 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         parameter_clip.update(norm=max_bin, dtype=DTYPE)
         save = parameter_clip.pop('save', None)
 
-        clipped, mask, high, low = clip(source, **parameter_clip)
-        not_low = np.logical_not(low)
+        clipped, mask, high_mask, low_mask = clip(source, **parameter_clip)
+        not_low_mask = np.logical_not(low_mask)
 
         if save:
             save = io.as_source(save)
             save[base_slicing] = clipped[valid_slicing]
 
         if binary_status is not None:
-            binary_status[high[valid_slicing]] += BINARY_STATUS['High']
+            binary_status[high_mask[valid_slicing]] += BINARY_STATUS['High']
         else:
-            sink[valid_slicing] = high[valid_slicing]
+            sink[valid_slicing] = high_mask[valid_slicing]
 
-        del high, low
+        del high_mask, low_mask
 
         if verbose:
             timer.print_elapsed_time('Clipping')
     else:
         clipped = source
-        mask = not_low = np.ones(source.shape, dtype=bool)
-    # active arrays: clipped, mask, not_low
+        mask = not_low_mask = np.ones(source.shape, dtype=bool)
+    # active arrays: clipped, mask, not_low_mask
 
     # lightsheet correction
     parameter_ls_correction = parameter.get('lightsheet_correction')
@@ -557,38 +556,37 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     else:
         corrected = clipped
     del clipped
-    # active arrays: corrected, mask, not_low
+    # active arrays: corrected, mask, not_low_mask
 
     # median filter
     parameter_median = parameter.get('median')
     if parameter_median:
         median = run_step('median', corrected, rnk.median, remove_previous_result=True,
-                          extra_kwargs={'mask': not_low, 'max_bin': max_bin}, **default_step_params)
+                          extra_kwargs={'mask': not_low_mask, 'max_bin': max_bin}, **default_step_params)
     else:
         median = corrected
     del corrected
-    # active arrays: median, mask, not_low
+    # active arrays: median, mask, not_low_mask
 
     # background removal
     parameter_bg_removal = parameter.get('background_removal')
     if parameter_bg_removal:
-        bg_subtracted = remove_background(median, mask, not_low, **parameter_bg_removal)
+        bg_subtracted = remove_background(median, mask, not_low_mask, **parameter_bg_removal)
     else:
         bg_subtracted = median
-    # active arrays: bg_subtracted, median, mask, not_low
+    # active arrays: bg_subtracted, median, mask, not_low_mask
 
     parameter_deconvolution = parameter.get('deconvolve')
     if parameter_deconvolution:
         parameter_deconvolution, timer = print_params(parameter_deconvolution, 'deconvolve', prefix, verbose)
 
         save = parameter_deconvolution.pop('save', None)
-        threshold = parameter_deconvolution.pop('threshold', None)
 
         if binary_status is not None:
             binarized = binary_status > 0
         else:
             binarized = sink[:]
-        deconvolved = deconvolve(bg_subtracted, binarized[:], **parameter_deconvolution)
+        deconvolved = deconvolve(bg_subtracted, binarized[:], timer, **parameter_deconvolution)
         del binarized
 
         if save:
@@ -600,7 +598,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     else:
         deconvolved = bg_subtracted
     del bg_subtracted
-    # active arrays: deconvolved, median, mask, not_low
+    # active arrays: deconvolved, median, mask, not_low_mask
 
     # gamma correction
     parameter_gamma = parameter.get('gamma')
@@ -608,7 +606,8 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         gamma_corrected = adjust_gamma(deconvolved, **parameter_gamma)
     else:
         gamma_corrected = deconvolved
-    # active arrays: gamma_corrected, median, mask, not_low
+    del deconvolved
+    # active arrays: gamma_corrected, median, mask, not_low_mask
 
     # morphACWE
     parameter_snake = parameter.get('snake')
@@ -620,10 +619,10 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
                                              **parameter_snake)
 
         snaked = snaked.astype(bool)
-        post_snake = postprocess_snake(source=snaked, mask=not_low)
+        post_snake = postprocess_snake(source=snaked, mask=not_low_mask)
         sink[valid_slicing] += post_snake[valid_slicing]
         timer.print_elapsed_time(r"Snake _/\_/\_o~")
-    del not_low
+    del not_low_mask
     # active arrays: gamma_corrected, median, mask
 
     # adaptive
@@ -874,19 +873,20 @@ def clip(source, clip_range=(300, 60000), norm=MAX_BIN, dtype=DTYPE):
 def adjust_gamma(source, gamma=0.45, gain=1):
     if gamma < 0:
         raise ValueError("Gamma should be a non-negative real number.")
-
+    elif gamma == 1:
+        return source
     dtype = source.dtype.type
     scale = float(np.max(source) - np.min(source))
     out = (((source / scale) ** gamma) * scale * gain).astype(dtype)
 
     return out
 
-def remove_background(source, mask, not_low, sigma, sigma_mask):
+def remove_background(source, mask, not_low_mask, sigma, sigma_mask):
     """Selective background subtraction by masked gaussian difference (normalized convolution)."""
     smoothed = np.zeros_like(source)
     smoothed[mask] = source[mask]
     smoothed = ndi.gaussian_filter(smoothed, sigma=sigma)
-    norm = ndi.gaussian_filter(not_low.astype(float), sigma=sigma_mask)
+    norm = ndi.gaussian_filter(not_low_mask.astype(float), sigma=sigma_mask)
     norm[norm == 0] = 1e-8
 
     background = smoothed / norm
