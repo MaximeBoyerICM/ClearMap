@@ -93,13 +93,13 @@ def devolve(source, sink = None, shape = None, dtype = None,
   sink, sink_buffer, sink_shape, sink_strides, = ap.initialize_sink(sink=sink, shape=shape, dtype=dtype, return_shape=True, return_strides=True, as_1d=True);
   
   if indices is None:
-    return sink;
-  indices = np.asarray(indices, dtype=int);
+    return sink
+  indices = np.asarray(indices, dtype=int)
   if indices.ndim == 1:
-    indices = indices[:,None];
+    indices = indices[:,None]
   
   if kernel is not None:
-    kernel = np.asarray(kernel, dtype=float);
+    kernel = np.asarray(kernel, dtype=float)
   
   if weights is None:
     if kernel is None:

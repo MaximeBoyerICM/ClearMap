@@ -586,7 +586,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             binarized = binary_status > 0
         else:
             binarized = sink[:]
-        deconvolved = deconvolve(bg_subtracted, binarized[:], timer, **parameter_deconvolution)
+        deconvolved = deconvolve(bg_subtracted, binarized[:], **parameter_deconvolution)
         del binarized
 
         if save:
@@ -913,14 +913,17 @@ def postprocess_snake(source, mask):
 
 
 def deconvolve(source, binarized, sigma=10):
+    binarized = np.nonzero(binarized)
+    original_values = source[binarized]
+
     convolved = np.zeros(source.shape, dtype=float)
-    convolved[binarized] = source[binarized]
+    convolved[binarized] = original_values
 
     for z in range(convolved.shape[2]):
         convolved[:, :, z] = ndi.gaussian_filter(convolved[:, :, z], sigma=sigma)
 
     deconvolved = source - np.minimum(source, convolved)
-    deconvolved[binarized] = source[binarized]
+    deconvolved[binarized] = original_values
     return deconvolved
 
 
