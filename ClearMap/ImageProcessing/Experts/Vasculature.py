@@ -17,14 +17,12 @@ __download__ = 'https://github.com/ClearAnatomics/ClearMap'
 import gc
 import tempfile
 import warnings
-import multiprocessing
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import scipy.ndimage as ndi
 import skimage.filters as skif
-from skimage.morphology import remove_small_objects, remove_small_holes
+from skimage.morphology import remove_small_objects
 
 import ClearMap.IO.IO as io
 
@@ -914,7 +912,7 @@ def postprocess_snake(source, mask):
 
 def deconvolve(source, binarized, sigma=10):
     binarized = np.nonzero(binarized)
-    original_values = source[binarized]
+    original_values = source[binarized]  # copy to prevent race condition
 
     convolved = np.zeros(source.shape, dtype=float)
     convolved[binarized] = original_values
