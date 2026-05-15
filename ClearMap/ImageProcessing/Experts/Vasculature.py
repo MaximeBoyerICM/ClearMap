@@ -93,16 +93,18 @@ default_binarization_parameter = dict(
 
     # deconvolution
     deconvolve=dict(sigma=10,
-                    threshold=750,
                     save=None),
+
+    threshold_bin = dict(threshold=750),
 
     # equalization
     equalize=dict(percentile=(0.4, 0.975),
                   selem=(200, 200, 5),
                   spacing=(50, 50, 5),
                   interpolate=1,
-                  threshold=1.1,
                   save=None),
+
+    bin_equalized=dict(threshold=1.1,),
 
     # adaptive threshold
     adaptive=dict(selem=(250, 250, 3),
@@ -111,19 +113,12 @@ default_binarization_parameter = dict(
                   save=None),
 
     # tubeness
-    vesselize=dict(background=dict(selem=('disk', (30, 30, 1)),
+    vesselize=dict(background_params=dict(selem=('disk', (30, 30, 1)),
                                    percentile=0.5),
                    tubeness=dict(sigma=1.0,
                                  gamma12=0.0),
                    threshold=120,
                    save=None),
-
-    # fill
-    fill=None,
-
-    # smooth
-    smooth=None,
-
     # controls
     binary_status=None,
     max_bin=MAX_BIN

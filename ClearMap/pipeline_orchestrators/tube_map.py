@@ -39,6 +39,8 @@ import ClearMap.Alignment.Resampling as resampling_module
 import ClearMap.Alignment.Elastix as elastix
 
 import ClearMap.ImageProcessing.Experts.Vasculature as vasculature
+import ClearMap.ImageProcessing.Experts.tube_map_pipeline as modular_vasculature
+import ClearMap.ImageProcessing.Experts.registry as registry
 import ClearMap.ImageProcessing.machine_learning.vessel_filling.vessel_filling as vessel_filling
 import ClearMap.ImageProcessing.Skeletonization.Skeletonization as skeletonization
 import ClearMap.ImageProcessing.Binary.Filling as binary_filling
@@ -284,18 +286,30 @@ class BinaryVesselProcessor(PipelineOrchestrator):
 
         if channel != self.all_vessels_channel:  # For arteries or veins
             binarization_parameter.update(equalize=None, vesselize=None)
+            binarization_parameter['pipeline'] = ["clip", "lightsheet", "median", "deconvolve", "threshold_bin", "adaptive"]
+        else:
+            binarization_parameter['pipeline'] = modular_vasculature.DEFAULT_TUBE_MAP_PIPELINE_STEPS
+
+        binarization_parameter['default_steps'] = registry.DEFAULT_STEP_FUNCTIONS  # TODO separate channels
+
+        pipeline_keys = set(binarization_parameter['pipeline'])
+        default_steps = set(binarization_parameter['default_steps'].keys())
+        assert pipeline_keys.issubset(default_steps)
+
+        binarization_parameter['custom_steps'] = binarization_cfg['binarize']['custom_steps']
 
         processing_parameter = copy.deepcopy(vasculature.default_binarization_processing_parameter)
         channel_perf = self.config['performance']['binarization']['single_channels'][channel]
         block_params = channel_perf['binarize']['block_processing']
+
         processing_parameter.update(
             processes=sanitize_n_processes(block_params['n_processes']),
             size_min=block_params['size_min'], size_max=block_params['size_max'],
             overlap=block_params['overlap'], as_memory=True, verbose=True)
 
-        vasculature.binarize(source, sink,
-                             binarization_parameter=binarization_parameter,
-                             processing_parameter=processing_parameter)
+        modular_vasculature.binarize_modular(source, sink,
+                                             binarization_parameter=binarization_parameter,
+                                             processing_parameter=processing_parameter)
 
     def plot_binarization_result(self, parent=None, channel='', arrange=False):
         """
