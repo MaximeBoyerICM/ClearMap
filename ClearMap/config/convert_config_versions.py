@@ -8,6 +8,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Callable, Dict, Tuple
 
+import numpy as np
 from packaging.version import Version
 from importlib_metadata import version as importlib_version
 
@@ -16,18 +17,21 @@ from PyQt5.QtWidgets import QApplication, QDialog
 
 from ClearMap.IO.assets_constants import CHANNELS_ASSETS_TYPES_CONFIG
 from ClearMap.Utils.tag_expression import Expression
-from ClearMap.Utils.utilities import try_get_item_recursive, set_item_recursive, has_item_recursive, DELETE, deep_merge
+from ClearMap.Utils.utilities import (try_get_item_recursive, set_item_recursive, has_item_recursive, deep_merge,
+                                      del_item_recursive)
 from ClearMap.config.config_handler import ConfigHandler, ALTERNATIVES_REG
 
 from ClearMap.gui.dialogs import RenameChannelsDialog, VerifyRenamingDialog
 from ClearMap.gui.dialog_helpers import get_directory_dlg
 from ClearMap.gui.gui_utils_base import ensure_qapp
 
+
 clearmap_version = importlib_version('ClearMap')
 VERSION_SUFFIX = f'v{Version(clearmap_version).major}_{Version(clearmap_version).minor}'
 
 
 SUPPORTED_VERSIONS = [Version(v) for v in ('2.1', '3.0', '3.1')]
+
 
 def _norm_ver(v) -> Version:
     return v if isinstance(v, Version) else Version(str(v))
@@ -86,9 +90,9 @@ def version_guard(from_v, to_v, key: str = 'clearmap_version'):
             cfg = read_cfg(v1_path)
             current = Version(str(cfg.get(key, '0.0.0')))
             if current == to_v:
-                warnings.warn(f'Config already in version {to_v}')
+                warnings.warn(f'Config already at version {to_v}')
                 return cfg.filename
-            if current != from_v:
+            if current != from_v and current != Version('0.0.0'):  # 0.0.0 (not set should default to 2.1, last ver not set)
                 raise ValueError(f'Only version {from_v} is supported (got {current})')
             return func(v1_path, *args, **kwargs)
         return wrapper
@@ -167,7 +171,7 @@ def convert_sample_2_1_to_3_0(v1_path, v2_path=''):
             continue
         config_v2['channels'][channel_name] = {
             'data_type': None,
-            'extension': config_v1['src_paths']['tile_extension'],  # TODO: check if .get with dot
+            'extension': config_v1['src_paths'].get('tile_extension', 'ome.tif'),  # TODO: check if .get with dot
             'path': config_v1['src_paths'][channel_name],
             'resolution': config_v1['resolutions'][channel_name],
             'orientation': config_v1['orientation'],
@@ -181,7 +185,7 @@ def convert_sample_2_1_to_3_0(v1_path, v2_path=''):
 
 @cfg_converter('2.1', '3.0', 'cell_map')
 @version_guard('2.1', '3.0')
-def convert_cell_map_2_1_to_3_0(v1_path, v2_path, channel_name='channel_0'):
+def convert_cell_map_2_1_to_3_0(v1_path, v2_path='', channel_name='channel_0'):
     config_v1, config_v2 = get_configs(v1_path, v2_path)
 
     config_v2['clearmap_version'] = '3.0.0'
@@ -219,7 +223,7 @@ def _alignment_to_stitching_v3(output_path_base, config_v1):
     channel_names = [k for k, use in config_v1['stitching']['run'].items() if use]
     for i, channel in enumerate(channel_names):
         out_stitching_cfg['channels'][channel] = {
-            'use_npy': config_v1['conversion']['use_npy'],
+            'use_npy': config_v1['conversion'].get('use_npy', True),
             'run': config_v1['stitching']['run'][channel],
             'layout_channel': channel,
         }
@@ -239,8 +243,15 @@ def _alignment_to_registration_v3(output_path_base, config_v1, sample_config):
     out_registration_cfg['clearmap_version'] = '3.0.0'
     # Copy registration parameters
     out_registration_cfg['verbose'] = config_v1['registration']['resampling']['verbose']
-    out_registration_cfg['atlas'] = {k: config_v1['registration']['atlas'][k]
-                                     for k in ('id', 'structure_tree_id', 'align_files_folder')}
+    if all(k in config_v1['registration']['atlas'].keys() for k in ('id', 'structure_tree_id', 'align_files_folder')):
+        out_registration_cfg['atlas'] = {k: config_v1['registration']['atlas'][k]
+                                         for k in ('id', 'structure_tree_id', 'align_files_folder')}
+    else:
+        out_registration_cfg['atlas'] = {
+            'id': 'ABA 2017 - adult mouse - 25µm',
+            'structure_tree_id': 'ABA json 2022',
+            'align_files_folder': 'Alignment'
+        }
     autofluo_params_files = [v for k, v in config_v1['registration']['atlas'].items() if k.startswith('align_reference')]
     resample = not (config_v1['registration']['resampling']['skip'])
 
@@ -597,11 +608,91 @@ def convert_2_1_to_3_0(main_folder='', create_app=True):
     upgrader.run()
 
 
-def migrate_vasculature_performance_v3_0_to_v3_1(
-    old_cfg: dict,
-    merged: dict,
-    default_cfg: dict,
-):
+def migrate_vasculature_postprocessing_v3_0_to_v3_1(old_cfg: dict, merged: dict, default_cfg: dict,
+        sample_cfg: dict | None = None) -> None:
+    """
+    Rename vessel_type_postprocessing thresholds from voxels to µm,
+    and fix the arteries_min_radius misnomer.
+
+    Conversion: old_vox × mean(spacing).
+    spacing is read from sample config if available, otherwise
+    falls back to a documented default with a warning.
+    """
+    # Try to get actual spacing from "vessels" channel in sample config
+    spacing = None
+    if sample_cfg is not None:
+        for ch_name, ch_cfg in sample_cfg['channels'].items():
+            if ch_cfg.get('data_type') == 'vessels':
+                spacing = np.array(ch_cfg['resolution'], dtype=float)
+                break
+
+    if spacing is not None:
+        vox_to_um_factor = float(np.mean(spacing))
+    else:
+        vox_to_um_factor = 1.9   # mean([1.625, 1.625, 2.5]) — documented fallback
+        warnings.warn(
+            f'No sample resolution found for vasculature config migration. '
+            f'Using fallback vox→µm factor={vox_to_um_factor:.1f}. '
+            f'Please verify vessel_type_postprocessing radius thresholds '
+            f'in the converted config.',
+            RuntimeWarning, stacklevel=2)
+
+    pre_filt_path = ['vessel_type_postprocessing', 'pre_filtering']
+    tracing_path  = ['vessel_type_postprocessing', 'tracing']
+    capillaries_rm_path = ['vessel_type_postprocessing', 'capillaries_removal']
+
+    # ── voxel radius → µm ────────────────────────────────────────────
+    vox_to_um_renames = {
+        'restrictive_vein_radius': 'restrictive_vein_radius_um',
+        'permissive_vein_radius':  'permissive_vein_radius_um',
+        'final_vein_radius':       'final_vein_radius_um',
+    }
+    for old_key, new_key in vox_to_um_renames.items():
+        old_path = pre_filt_path + [old_key]
+        new_path = pre_filt_path + [new_key]
+        val = try_get_item_recursive(old_cfg, old_path, None)
+        if val is not None:
+            scaled_val = round(float(val) * vox_to_um_factor, 2)
+            set_item_recursive(merged, new_path, scaled_val)
+            del_item_recursive(merged, old_path)
+
+    capillaries_rm_renames = {
+        'min_artery_size': 'min_artery_component_edges',
+        'min_vein_size': 'min_vein_component_edges',
+    }
+    for old_key, new_key in capillaries_rm_renames.items():  # REFACTOR: too similar to above
+        old_p = capillaries_rm_path + [old_key]
+        new_p = capillaries_rm_path + [new_key]
+        val = try_get_item_recursive(old_cfg, old_p, None)
+        if val is not None:
+            set_item_recursive(merged, new_p, int(val))
+            del_item_recursive(merged, old_p)
+
+    # ── arteries_min_radius → arteries_min_noise_edges ───────────
+    old_path = pre_filt_path + ['arteries_min_radius']
+    new_path = pre_filt_path + ['arteries_min_noise_edges']
+    val = try_get_item_recursive(old_cfg, old_path, None)
+    if val is not None:
+        set_item_recursive(merged, new_path, int(val))
+        del_item_recursive(merged, old_path)
+
+    # ── new tracing keys absent in 3.0 — fill from defaults if missing ───
+    new_tracing_defaults = {
+        'vein_trace_radius_um': try_get_item_recursive(default_cfg, tracing_path + ['vein_trace_radius_um'], 8.0),
+        'artery_trace_radius_um': try_get_item_recursive(default_cfg, tracing_path + ['artery_trace_radius_um'], 6.4),
+        'distance_to_surface_min': try_get_item_recursive(default_cfg, tracing_path + ['distance_to_surface_min'], 15.0),
+        'artery_intensity_min': try_get_item_recursive(default_cfg, tracing_path + ['artery_intensity_min'], 200.0),
+        'vein_intensity_min': try_get_item_recursive(default_cfg, tracing_path + ['vein_intensity_min'], 200.0),
+    }
+    for key, default_val in new_tracing_defaults.items():
+        path = tracing_path + [key]
+        if not has_item_recursive(merged, path):
+            set_item_recursive(merged, path, default_val)
+
+    del_item_recursive(merged, tracing_path + ['artery_trace_radius'])
+
+
+def migrate_vasculature_performance_v3_0_to_v3_1(old_cfg: dict, merged: dict, default_cfg: dict, sample_config: dict) -> None:
     mappings = [
         (['binarization', 'vessels', 'deep_fill'],
          ['performance', 'binarization', 'channels', 'vessels', 'deep_fill', 'block_processing']),
@@ -622,9 +713,13 @@ def migrate_vasculature_performance_v3_0_to_v3_1(
                 set_item_recursive(merged, new_path + ['overlap'], overlap)
 
         # --- delete legacy keys from merged ---
-        set_item_recursive(merged, old_path + ['size_max'], DELETE)
-        set_item_recursive(merged, old_path + ['overlap'], DELETE)
+        del_item_recursive(merged, old_path + ['size_max'])
+        del_item_recursive(merged, old_path + ['overlap'])
 
+
+def migrate_vasculature_v3_0_to_v3_1(old_cfg, merged, default_cfg, sample_config):
+    migrate_vasculature_performance_v3_0_to_v3_1(old_cfg, merged, default_cfg, sample_config)
+    migrate_vasculature_postprocessing_v3_0_to_v3_1(old_cfg, merged, default_cfg, sample_config)
 
 
 def make_generic_3_0_to_3_1_converter(config_type: str,
@@ -644,7 +739,7 @@ def make_generic_3_0_to_3_1_converter(config_type: str,
 
     @cfg_conv_decorator('3.0', '3.1', canonical)
     @version_guard('3.0', '3.1')
-    def _convert_3_0_to_3_1(v1_path, v2_path=''):
+    def _convert_3_0_to_3_1(v1_path, v2_path='', sample_config=None):
         v1_path = Path(v1_path).expanduser().resolve()
 
         if not v2_path:
@@ -667,7 +762,7 @@ def make_generic_3_0_to_3_1_converter(config_type: str,
         deep_merge(merged, cfg_v1)
 
         if migration_func is not None:  # Optional (and section specific)
-            migration_func(cfg_v1, merged, default_cfg)
+            migration_func(cfg_v1, merged, default_cfg, sample_config)
 
         # COPY (shallow copy of top-level keys is enough;
         #       nested sections stay as config-like objects.)
@@ -684,16 +779,16 @@ def make_generic_3_0_to_3_1_converter(config_type: str,
     return _convert_3_0_to_3_1
 
 
-
 convert_sample_3_0_to_3_1 = make_generic_3_0_to_3_1_converter('sample')
 convert_stitching_3_0_to_3_1 = make_generic_3_0_to_3_1_converter('stitching')
 convert_registration_3_0_to_3_1 = make_generic_3_0_to_3_1_converter('registration')
 convert_cell_map_3_0_to_3_1 = make_generic_3_0_to_3_1_converter('cell_map')
 convert_tract_map_3_0_to_3_1 = make_generic_3_0_to_3_1_converter('tract_map')
 convert_colocalization_3_0_to_3_1 = make_generic_3_0_to_3_1_converter('colocalization')
-# convert_vasculature_3_0_to_3_1 = make_generic_3_0_to_3_1_converter('vasculature')
-convert_vasculature_3_0_to_3_1   = make_generic_3_0_to_3_1_converter(
-    'vasculature', migration_func=migrate_vasculature_performance_v3_0_to_v3_1)
+convert_vasculature_3_0_to_3_1 = make_generic_3_0_to_3_1_converter(
+    'vasculature', migration_func=migrate_vasculature_v3_0_to_v3_1)
+# convert_vasculature_3_0_to_3_1   = make_generic_3_0_to_3_1_converter(
+#     'vasculature', migration_func=migrate_vasculature_performance_v3_0_to_v3_1)
 convert_batch_3_0_to_3_1 = make_generic_3_0_to_3_1_converter('batch_processing')
 convert_group_analysis_3_0_to_3_1 = make_generic_3_0_to_3_1_converter('group_analysis')
 
@@ -763,19 +858,23 @@ def convert_versions(previous_version: str, new_version: str, *,
     exp_dir = str(Path(exp_dir).expanduser().resolve())
     previous_version = _norm_ver(previous_version)
     new_version = _norm_ver(new_version)
+
     if previous_version == new_version:
         warnings.warn(f'No conversion needed: already at version {new_version}')
         return
 
-    # Look up in registry
-    converter = PROJECT_CONVERTERS.get((previous_version, new_version))
-    if not converter:
-        raise NotImplementedError(
-            f'No converter registered for {previous_version} → {new_version}. '
-            f'Supported: {SUPPORTED_VERSIONS}'
-        )
+    steps = get_conversion_steps(previous_version, new_version)
 
-    converter(exp_dir, create_app=create_app)
+    for from_v, to_v in steps:
+        converter = PROJECT_CONVERTERS.get((from_v, to_v))
+        if not converter:
+            raise NotImplementedError(
+                f'No project converter registered for {from_v} → {to_v}. '
+                f'Supported steps: {SUPPORTED_VERSIONS}')
+        print(f'Converting {from_v} → {to_v}...')
+        converter(exp_dir, create_app=create_app)
+        print(f'✓ {from_v} → {to_v} complete')
+
     print(f'\n✓ Upgrade complete: {previous_version} → {new_version}\n')
 
 

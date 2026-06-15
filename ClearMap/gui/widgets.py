@@ -50,7 +50,8 @@ from ClearMap.config.atlas import STRUCTURE_TREE_NAMES_MAP
 from ClearMap.config.config_handler import scan_folder_for_experiments
 
 from ClearMap.gui import dialog_helpers as dlg_help
-from ClearMap.gui.gui_utils_base import create_clearmap_widget, compute_grid, get_widget, delete_widget, clear_layout
+from ClearMap.gui.gui_utils_base import create_clearmap_widget, compute_grid, get_widget, delete_widget, clear_layout, \
+    unique_connect
 from ClearMap.gui.gui_utils_images import get_pseudo_random_color, is_dark
 
 USER_NAME = getpass.getuser()
@@ -348,12 +349,12 @@ class ProgressWatcher(QWidget):  # Inspired from https://stackoverflow.com/a/662
 
         Parameters
         ----------
-        step_name
-            str
-        step_length
-            int The number of steps in the operation
-        pattern
-            str or re.Pattern or (str, re.Pattern) the text to look for in the logs to check for progress
+        step_name:  str
+            Name (title) of the substep
+        step_length: int
+            The number of steps in the operation
+        pattern:  str or re.Pattern or (str, re.Pattern) or None
+            the text to look for in the logs to check for progress
         """
         self.max_progress = step_length
         self.pattern = pattern
@@ -1153,9 +1154,12 @@ class ManageAssetsWidget(WizardWidget):
                 sources = [asset.path for asset in assets]
                 if all([asset.shape() == assets[0].shape() for asset in assets]):
                     sources = [sources]  # overlay
-                plot_3d.plot(sources, arrange=False, lut='grey')  # REFACTORING: in WS2 ?
-            for asset in assets:
-                getattr(asset, action_name)(**params)
+                dvs = plot_3d.plot(sources, arrange=False, lut='grey',
+                                   parent=self.app.centralWidget())
+                self.app.setup_plots(dvs)
+            else:
+                for asset in assets:
+                    getattr(asset, action_name)(**params)
         else:
             method = getattr(self.sample_manager, f'{action_name}_assets')
             # WARNING: resample and crop will need extra dialog to get the parameters
@@ -1355,17 +1359,17 @@ class PatternDialog(WizardWidget):
         self.dlg.setMinimumWidth(needed_width)
         self.dlg.resize(needed_width, self.dlg.sizeHint().height())
 
-    @staticmethod
-    def _measure_rich_label(label):
-        """
-        Accurately measure the rendered width of a QLabel containing HTML.
-        QLabel.sizeHint() is unreliable for rich text, so we use QTextDocument.
-        """
-        doc = QTextDocument()
-        doc.setDefaultFont(label.font())
-        doc.setHtml(label.text())
-        doc.setDocumentMargin(0)
-        return int(doc.idealWidth()) + 10  # small safety margin
+    # @staticmethod
+    # def _measure_rich_label(label):
+    #     """
+    #     Accurately measure the rendered width of a QLabel containing HTML.
+    #     QLabel.sizeHint() is unreliable for rich text, so we use QTextDocument.
+    #     """
+    #     doc = QTextDocument()
+    #     doc.setDefaultFont(label.font())
+    #     doc.setHtml(label.text())
+    #     doc.setDocumentMargin(0)
+    #     return int(doc.idealWidth()) + 10  # small safety margin
 
     def get_widgets(self, image_group_id, axis):
         """
@@ -1406,6 +1410,12 @@ class PatternDialog(WizardWidget):
         group_controls.dataTypeComboBox.addItems(data_types)
         group_controls.dataTypeComboBox.setCurrentText('undefined')
 
+        def _on_import_toggled(checked, page=group_controls):
+            page.setEnabled(checked)
+            group_controls.importChannelCheckBox.setEnabled(True)  # keep checkbox itself always active
+
+        group_controls.importChannelCheckBox.toggled.connect(_on_import_toggled)
+
         self.n_image_groups += 1
 
     def connect_buttons(self):
@@ -1425,15 +1435,17 @@ class PatternDialog(WizardWidget):
         pattern_idx = tool_box.currentIndex()
         pattern = self.patterns_finders[pattern_idx].pattern
 
-        axis_names = []
+        # Convert generic axes names (I, J, K...) to coordinate axes (X, Y, Z) based on the user selection in the combo boxes
+        axis_names = []  # TODO: avoid duplicated axes
         for i in range(pattern.n_tags()):
             _, _, combo_widget = self.get_widgets(pattern_idx, i)
             axis_names.append(combo_widget.currentText())
-
         pattern.assign_axes_from_combo(axis_names)
 
         result_widget = tool_box.widget(pattern_idx).result
-        result_widget.setText(pattern.relative_string(self.src_folder))
+        result_widget.setTextFormat(Qt.PlainText)  # Avoid conversion to html and stripping of <X,I,2> pattern elements
+        formatted_pattern = pattern.relative_string(self.src_folder)
+        result_widget.setText(formatted_pattern)
 
         self._fit_to_content()
 
@@ -1467,26 +1479,34 @@ class PatternDialog(WizardWidget):
         return [page.channelNameLineEdit.text() for page in self._get_channel_pages()]
 
     def all_channels_defined(self):
-        return all([page.dataTypeComboBox.currentText() != 'undefined' for page in self._get_channel_pages()])
+        return all([page.dataTypeComboBox.currentText() != 'undefined'
+                    for page in self._get_channel_pages()
+                    if page.importChannelCheckBox.isChecked()])
 
     def get_results(self) -> List[ChannelPatternSpec]:
         return self._pattern_results
 
     def save_results(self):
-        """
-        Save the file patterns to the `sample` configuration file and close the dialog
-        """
-        if not self.all_channels_defined():
-            dlg_help.warning_popup('Some data types are not defined, '
-                                   'please select a valid data type before saving')
+        pages_to_import = [(i, p) for i, p in enumerate(self._get_channel_pages())
+                           if p.importChannelCheckBox.isChecked()]
+
+        if not pages_to_import:
+            dlg_help.warning_popup('No channels selected for import.')
+            return None
+
+        undefined = [p for _, p in pages_to_import
+                     if p.dataTypeComboBox.currentText() == 'undefined']
+        if undefined:
+            dlg_help.warning_popup('Some selected channels have undefined data types. '
+                                   'Please select a valid data type or uncheck the channel.')
             return None
 
         specs: List[ChannelPatternSpec] = []
-        for i, page in enumerate(self._get_channel_pages()):
+        for original_idx, page in pages_to_import:
             channel_name = page.channelNameLineEdit.text()
 
             if not page.result.text():
-                self.dlg.patternToolBox.setCurrentIndex(i)
+                self.dlg.patternToolBox.setCurrentIndex(original_idx)
                 self.validate_pattern()
 
             specs.append(ChannelPatternSpec(
@@ -2007,13 +2027,17 @@ class PerfMonitor(QWidget):
         return round(psutil.cpu_percent())
 
     def get_thread_percent(self):
-        try:
-            clear_map_proc_cpu = [proc.cpu_percent() for proc in psutil.process_iter()
-                                  if proc and 'python' in proc.name().lower() and
-                                  USER_NAME in proc.username() and
-                                  'clearmap' in proc.exe().lower()]
-        except psutil.NoSuchProcess:
-            clear_map_proc_cpu = []
+        clear_map_proc_cpu = []
+        for proc in psutil.process_iter(['name', 'username', 'exe', 'cpu_percent']):
+            try:
+                info = proc.info  # pre-fetched by process_iter attrs
+                name = (info.get('name') or '').lower()
+                user = (info.get('username') or '')
+                exe = (info.get('exe') or '').lower()
+                if 'python' in name and USER_NAME in user and 'clearmap' in exe:
+                    clear_map_proc_cpu.append(info.get('cpu_percent') or 0)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
         # The name filter is not sufficient but necessary because the exe is not always allowed
         return max(clear_map_proc_cpu) if clear_map_proc_cpu else 0
 
@@ -2046,22 +2070,21 @@ class PerfMonitor(QWidget):
     def handle_gpu_vals_updated(self):
         try:
             with open(self.gpu_proc_file_path, 'r') as proc_file:
-                line = proc_file.read()
+                line = proc_file.read().strip()
                 if not line:
                     return
                 elems = line.split(',')
                 if len(elems) < 3:
                     return
-                mem_used, mem_total, gpu_percent = [s.strip() for s in elems]
+                mem_used, mem_total, gpu_percent = [s.strip() for s in elems][:3]  # cap to first 3
                 percent_v_ram = int((float(mem_used) / float(mem_total)) * 100)
                 percent_gpu = int(gpu_percent)
             if percent_gpu != self.percent_gpu or percent_v_ram != self.percent_v_ram:
                 self.percent_gpu = percent_gpu
                 self.percent_v_ram = percent_v_ram
                 self.gpu_vals_changed.emit(self.percent_gpu, self.percent_v_ram)
-        except ValueError as err:
-            print(err)
-            pass
+        except (ValueError, ZeroDivisionError) as err:
+            print(f'GPU monitor: {err}')
 
 
 class ExtendableTabWidget(QTabWidget):
@@ -2413,6 +2436,7 @@ class ComparisonsWidgetAdapter:
 
     def rebuild(self, model: ComparisonsModel, *, on_plot_group: Callable[[str], None],
                 channels: List[str], on_channel_changed: Callable[[str], None],
+                suffixes: List[str] = None,
                 preselected_comparisons: Optional[List[Pair]] = None) -> None:
 
         # Rescue persistent widgets BEFORE clearing
@@ -2448,13 +2472,30 @@ class ComparisonsWidgetAdapter:
         # Re-insert the stashed widget
         if self._suffix_widget is not None:
             self._layout.addWidget(self._suffix_widget)
+            # Update combobox
+            if suffixes is not None:
+                combo = self._suffix_widget.findChild(QComboBox, 'densitySuffixComboBox')
+                if combo:
+                    combo.blockSignals(True)
+                    current = combo.currentText()
+                    combo.clear()
+                    combo.addItems(suffixes)
+                    if current in suffixes:
+                        combo.setCurrentText(current)
+                    elif suffixes:
+                        combo.setCurrentText(suffixes[0])
+                    combo.blockSignals(False)
 
         # Channel to plot combobox
         if channels:
+            lyt = QHBoxLayout(parent=self._layout)
+            plot_channel_lbl = QLabel('Channel: ')
+            lyt.addWidget(plot_channel_lbl)
             plot_channel_combobox = QComboBox()
             plot_channel_combobox.addItems(channels)
             plot_channel_combobox.currentTextChanged.connect(on_channel_changed)
-            self._layout.addWidget(plot_channel_combobox)
+            lyt.addWidget(plot_channel_combobox)
+            self._layout.addLayout(lyt)
             self._channel_combo = plot_channel_combobox
 
         self._layout.addStretch()
@@ -2507,7 +2548,53 @@ class GroupPage:
             self._add_folder(on_changed))
         self._widget.gpRemoveSrcFolderBtn.clicked.connect(lambda:
             self._remove_selected(on_changed))
+        self._setup_list_drag_drop(on_changed)
         self._config_connected = True
+
+    def _setup_list_drag_drop(self, on_changed: Callable[[], None]) -> None:
+        """
+        Enable folder drag-drop on the group list widget.
+        Dropping a folder scans it for experiments via scan_folder_for_experiments:
+          - if sub-experiments are found, all are added (batch drop)
+          - otherwise the folder itself is added as a single experiment
+        Duplicate entries are silently skipped.
+        """
+        lst = self._widget.gpListWidget
+        lst.setAcceptDrops(True)
+
+        def _existing() -> set[str]:
+            return {lst.item(i).text() for i in range(lst.count())}
+
+        def _drag_enter(event):
+            if event.mimeData().hasUrls():
+                if all(Path(u.toLocalFile()).is_dir()
+                       for u in event.mimeData().urls()):
+                    event.acceptProposedAction()
+                    return
+            event.ignore()
+
+        def _drop(event):
+            added = False
+            existing = _existing()
+            for url in event.mimeData().urls():
+                folder = Path(url.toLocalFile())
+                if not folder.is_dir():
+                    continue
+                exp_roots = scan_folder_for_experiments(folder)
+                candidates = (natsorted(str(p) for p in exp_roots)
+                              if exp_roots else [str(folder)])
+                for path in candidates:
+                    if path not in existing:
+                        lst.addItem(path)
+                        existing.add(path)
+                        added = True
+            if added:
+                on_changed()
+            event.acceptProposedAction()
+
+        lst.dragEnterEvent = _drag_enter
+        lst.dragMoveEvent = _drag_enter  # same check for hover
+        lst.dropEvent = _drop
 
     # --- actions ---
     def _add_folder(self, on_changed: Callable[[], None]) -> None:
@@ -2551,33 +2638,57 @@ class GroupsWidgetAdapter(QWidget):
         self._ui_name = groups_ui_file
         self._pages: List[GroupPage] = []
         self._on_changed: Optional[Callable[[], None]] = None
+        self._rebuilding: bool = False  # re-entrancy guard for set_value
 
     # ---- ParamLink surface -------------------------------------------------
     def set_value(self, groups: Dict[str, List[str]]) -> None:
-        self._clear()
-        for name, paths in groups.items():
-            idx = self._append_page(name, paths)
-            # keep tab label in sync with gpNameLineEdit
-            # TODO: check if redundant
-            # self._pages[idx].connect_group_name_changed(
-            #     lambda txt, i=idx: self._toolbox.setItemText(i, self.__gp_name(txt, i))
-            # )
+        if self._rebuilding:   # prevent re-entrant calls from cfg_to_ui
+            return
+        self._rebuilding = True
+        try:
+            self._clear()
+            for name, paths in groups.items():
+                idx = self._append_page(name, paths)
+                # keep tab label in sync with gpNameLineEdit
+                # TODO: check if redundant
+                # self._pages[idx].connect_group_name_changed(
+                #     lambda txt, i=idx: self._toolbox.setItemText(i, self.__gp_name(txt, i))
+                # )
+        finally:
+            self._rebuilding = False
 
     def get_value(self) -> Dict[str, List[str]]:
         return {page.name: page.paths for page in self._pages}
 
     def connect(self, on_changed: Callable[[], None]) -> None:
+        if self._on_changed is not None:
+            return  # already connected — guard against double-bind
         self._on_changed = on_changed
-        # add/remove group
-        self._add_btn.clicked.connect(lambda: (self._append_page(), on_changed()))
-        self._rm_btn.clicked.connect(lambda: (self._remove_current_page(), on_changed()))
-        # wire pages
+
+        # disconnect_all=True because lambdas can't be identified for targeted disconnect
+        unique_connect(self._add_btn.clicked,
+                       lambda: self._on_add_clicked(on_changed),
+                       disconnect_all=True)
+        unique_connect(self._rm_btn.clicked,
+                       lambda: self._on_rm_clicked(on_changed),
+                       disconnect_all=True)
+
         for i, p in enumerate(self._pages):
             p.connect(on_changed)
             self._sync_label(i)
 
+    def _on_add_clicked(self, on_changed: Callable[[], None]) -> None:  # TODO: check if we shouldn't add a self._rebuilding guard here.
+        self._append_page()         # UI update first
+        if not self._rebuilding:    # skip config write if we're mid-rebuild
+            on_changed()
+
+    def _on_rm_clicked(self, on_changed: Callable[[], None]) -> None:  # TODO: check if we shouldn't add a self._rebuilding guard here.
+        self._remove_current_page()
+        if not self._rebuilding:
+            on_changed()
+
    # ---- public API for wizards / params -----------------------------------
-    def add_group(self, name: Optional[str] = None, paths: Optional[List[str]] = None) -> int:
+    def add_group(self, name: Optional[str] = None, paths: Optional[List[str]] = None) -> int:  # TODO: check if we shouldn't add a self._rebuilding guard here.
         """Add a new (possibly empty) group and return its index."""
         idx = self._append_page(name=name, paths=paths)
         if self._on_changed:
@@ -2637,12 +2748,14 @@ class GroupsWidgetAdapter(QWidget):
                      on_changed: Optional[Callable[[], None]] = None) -> int:
         on_changed = on_changed or self._on_changed
         page = GroupPage(ui_name=self._ui_name, start_folder_getter=self._start)
-        if name:
-            page.name = name
+
         if paths:
             page.paths = paths
+
         idx = self._toolbox.count()
-        self._toolbox.addItem(page.widget, self.__gp_name(name, idx))
+        name = self.__gp_name(name, idx) # Avoids collisions
+        page.name = name
+        self._toolbox.addItem(page.widget, name)
         self._pages.append(page)
         # self._layout.addWidget(self._toolbox)
         page.connect_group_name_changed(
@@ -2676,7 +2789,7 @@ class GroupsWidgetAdapter(QWidget):
             self._pages.pop(idx)
 
     def __gp_name(self, name, idx):
-        return name or f"Group {idx + 1}"
+        return name or f"Group_{idx + 1}"
 
 
 class NProcessesWidget(QWidget):
@@ -2688,7 +2801,16 @@ class NProcessesWidget(QWidget):
     """
     valueChanged = pyqtSignal(int)
 
-    def __init__(self, parent=None, label: str = "n_processes"):
+    def __init__(self, parent: QWidget | None = None, label: str = 'n_processes'):
+        """
+
+        Parameters
+        ----------
+        parent: QWidget | None
+            The optional parent widget
+        label: str
+            The title of the widget
+        """
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)

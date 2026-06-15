@@ -206,6 +206,15 @@ def make_abs(directory, file_name):
     return f_path
 
 
+def del_item_recursive(d: dict, keys: list) -> None:
+    """Delete a nested key from a dict. No-op if path does not exist."""
+    for key in keys[:-1]:
+        d = d.get(key)
+        if not isinstance(d, dict):
+            return
+    d.pop(keys[-1], None)
+
+
 def get_item_recursive(container, keys):
     try:
         return reduce(getitem, keys, container)
@@ -379,7 +388,6 @@ def _dedupe_preserve_order(seq, key=lambda x: x):
         seen.add(k)
         out.append(x)
     return out
-
 
 
 def requires_assets(asset_specs):

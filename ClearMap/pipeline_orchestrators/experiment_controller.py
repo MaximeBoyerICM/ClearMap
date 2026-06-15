@@ -48,7 +48,6 @@ from ClearMap.Utils.event_bus import EventBus, BusSubscriberMixin
 from ClearMap.Utils.events import WorkspaceChanged, UiChannelRenamed, UiChannelsChanged
 from ClearMap.config.config_adjusters.type_hints import AdjusterScope
 from ClearMap.config.config_coordinator import ConfigCoordinator
-from ClearMap.config.config_handler import ALTERNATIVES_REG
 from ClearMap.config.defaults_provider import DefaultsProvider
 from ClearMap.pipeline_orchestrators.group_orchestrators import DensityGroupAnalysisOrchestrator
 from ClearMap.pipeline_orchestrators.processor_launcher import ProcessorLauncher
@@ -277,9 +276,13 @@ class ExperimentController(BusSubscriberMixin):
         return self._exp_dir
 
     def set_experiment_dir(self, exp_dir: str | Path) -> None:
+        # Clear cached workers if directory changed (they hold old workspace refs)
+        if self._exp_dir is not None and self._exp_dir != exp_dir:
+            self._workers.clear()
+
         self._exp_dir = Path(exp_dir).expanduser().resolve()
         self.cfg_coordinator.set_base_dir(self._exp_dir)
-        self.sample_manager.setup(exp_dir)
+        self.sample_manager.setup(self._exp_dir)
         self.publish(WorkspaceChanged(exp_dir=str(self._exp_dir)))
 
     @staticmethod
@@ -359,6 +362,9 @@ class ExperimentController(BusSubscriberMixin):
                                         validate=True, commit=True)
         finally:
             self._hydrating = False
+
+        stitching_worker = self.get_worker('stitching')
+        return stitching_worker.prepare_all_channels_raw_data()
 
     def boot_new(self, dest_dir: Optional[Path] = None, template_dir: Optional[Path] = None) -> None:
         """
@@ -684,20 +690,42 @@ class AnalysisGroupController:
         exp_controller = self._get_or_create_exp_controller(sample_src_dir)
         return exp_controller.sample_manager
 
-    def get_density_orchestrator(self) -> "DensityGroupAnalysisOrchestrator":
-        if self._analysis_worker is not None:
-            return self._analysis_worker
-        analysis_worker = DensityGroupAnalysisOrchestrator(group_controller=self)
-        if self._progress_watcher:
-            analysis_worker.set_progress_watcher(self._progress_watcher)
-        if self._thread_wrapper:
-            analysis_worker.set_thread_wrapper(self._thread_wrapper)
-        self._analysis_worker = analysis_worker
-        return analysis_worker
+    @property
+    def density_orchestrator(self) -> "DensityGroupAnalysisOrchestrator":
+        if self._analysis_worker is None:
+            analysis_worker = DensityGroupAnalysisOrchestrator(group_controller=self, pipeline=self._infer_pipeline())
+            if self._progress_watcher:
+                analysis_worker.set_progress_watcher(self._progress_watcher)
+            if self._thread_wrapper:
+                analysis_worker.set_thread_wrapper(self._thread_wrapper)
+            self._analysis_worker = analysis_worker
+        return self._analysis_worker
 
     # FIXME: check this
     def infer_required_sections(self) -> set[str]:
         return {'group_analysis', 'batch_processing'}
+
+    def set_pipeline(self, pipeline: str) -> None:
+        """
+        Single entry point for pipeline changes.
+        Updates config and orchestrator atomically.
+        """
+        self.apply_patch({'group_analysis': {'pipeline': pipeline}})
+        self.density_orchestrator.pipeline = pipeline  # setter handles invalidation
+
+    def _infer_pipeline(self) -> str:
+        """
+        Read pipeline from group config.
+        Falls back to 'CellMap' if not set.
+        """
+        try:
+            cfg = self.get_config_view()
+            pipeline = (cfg.get('group_analysis', {}).get('pipeline')
+                        or cfg.get('batch_processing', {}).get('pipeline'))
+            if pipeline:
+                return pipeline
+        except Exception:
+            return 'CellMap'  # fallback
 
     def get_config_view(self) -> dict[str, Any]:
         return self.group_cfg_coordinator.get_config_view()

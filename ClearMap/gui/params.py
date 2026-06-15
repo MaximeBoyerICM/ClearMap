@@ -21,17 +21,19 @@ from ClearMap.Utils.utilities import (validate_orientation, snake_to_title, set_
                                       DEFAULT_ORIENTATION, trim_or_pad, REPLACE)
 from ClearMap.Utils.event_bus import Publishes, EventBus
 from ClearMap.Utils.events import (UiChannelRenamed, UiCropChanged, UiOrientationChanged, UiRequestPlotAtlas,
-                                   UiConvertToClearMapFormat, UiRequestPlotMiniBrain, UiChannelsChanged,
+                                   UiPrepareRawDataForClearMap, UiRequestPlotMiniBrain, UiChannelsChanged,
                                    UiLayoutChannelChanged, UiUseExistingLayoutChanged, UiAlignWithChanged,
                                    UiRequestLandmarksDialog, UiAtlasIdChanged, UiAtlasStructureTreeIdChanged,
                                    UiVesselGraphFiltersChanged, UiBatchResultsFolderChanged, UiBatchGroupsChanged)
 
 from .gui_utils_base import replace_widget
 from .params_mixins import OrthoviewerSlicingMixin
+from .pipeline_model import BINARIZATION_STEPS, PipelineStep, LinearPipeline
+from .pipeline_widgets import LinearPipelineWidget
 from .widget_monkeypatch_callbacks import recursive_patch_compound_boxes
 from .params_interfaces import (ParamLink, UiParameter, ChannelUiParameter, UiParameterCollection,
                                 ChannelsUiParameterCollection, VectorLink, invert, param_setter, param_handler,
-                                list_widget_setter, list_widget_getter)
+                                list_widget_setter, list_widget_getter, _linear_pipeline_connector)
 from .widgets import LandmarksWeightsPanel, ComparisonsModel, ComparisonsWidgetAdapter, Pair, GroupsWidgetAdapter, \
     FileDropListWidget
 
@@ -124,7 +126,8 @@ class SampleChannelParameters(ChannelUiParameter):
             'geometry_settings_from': ParamLink(None, self.tab.sampleChannelGeometryChannelComboBox),
             'data_type': ParamLink(['data_type'], self.tab.dataTypeComboBox),
             'extension': ParamLink(['extension'], self.tab.extensionComboBox),
-            'path': ParamLink(['path'], self.tab.pathPlainTextEdit),
+            'path': ParamLink(['path'], self.tab.pathPlainTextEdit,
+                              notify_apply=self._update_convert_button_label),
             'resolution': VectorLink(['resolution'], self.tab.resolutionTriplet,
                                      disabled_value=None, ui_sentinel=-1,
                                      default_on_enable=[1.0, 1.0, 1.0],
@@ -140,6 +143,10 @@ class SampleChannelParameters(ChannelUiParameter):
                                  notify_apply=self._publish_crop_changed),
             'orientation': ['orientation']  #  Last in case of validation issues
         }
+
+    def cfg_to_ui(self):
+        super().cfg_to_ui()
+        self._update_convert_button_label()  # Force run after hydration endc
 
     def _publish_crop_changed(self, _=None):
         self.publish(UiCropChanged(channel_name=self.name, slice_x=self.slice_x,
@@ -203,12 +210,34 @@ class SampleChannelParameters(ChannelUiParameter):
         if 0 not in ori:  # i.e. fully defined
             self.publish(UiOrientationChanged(channel_name=self.name, orientation=ori))
 
+    def _update_convert_button_label(self, _=None):
+        """Update the button text based on the channel's raw path pattern."""
+        btn = self.tab.convertToClearMapPushButton
+        try:
+            path = self.path  # reads from widget via ParamLink
+            if not path:
+                btn.setText('Import to workspace')
+                return
+
+            from ClearMap.Utils.tag_expression import Expression
+            exp = Expression(path)
+            tag_names = set(exp.tag_names())
+
+            if tag_names & {'X', 'Y'}:
+                btn.setText('Convert tiles to numpy')
+            elif 'Z' in tag_names:
+                btn.setText('Stack layers into volume')
+            else:
+                btn.setText('Import to workspace')
+        except Exception:
+            btn.setText('Import to workspace')
+
 
 class SampleParameters(ChannelsUiParameterCollection):
     """
     Class that links the sample params file to the UI
     """
-    publishes = Publishes(UiConvertToClearMapFormat, UiRequestPlotMiniBrain, UiRequestPlotAtlas,
+    publishes = Publishes(UiPrepareRawDataForClearMap, UiRequestPlotMiniBrain, UiRequestPlotAtlas,
                           UiChannelRenamed, UiChannelsChanged, UiOrientationChanged, UiCropChanged)
 
     cfg_subtree = ['sample']
@@ -358,7 +387,7 @@ class SampleParameters(ChannelsUiParameterCollection):
                 func(self.get_channel_name(idx))
 
         channel_params.tab.convertToClearMapPushButton.clicked.connect(
-            functools.partial(publish_with_current_name, UiConvertToClearMapFormat),
+            functools.partial(publish_with_current_name, UiPrepareRawDataForClearMap),
             type=Qt.UniqueConnection)  # avoid double binding (PyQt >= 5.14)
         channel_params.tab.plotMiniBrainPushButton.clicked.connect(
             functools.partial(publish_with_current_index, UiRequestPlotMiniBrain),
@@ -1097,6 +1126,7 @@ class ChannelCellMapParams(ChannelUiParameter, OrthoviewerSlicingMixin):
                                                  disabled_value=None, default_on_enable=[0, 65535],
                                                  cast_from_ui=self.cast_max_from_ui),
             'voxelization_radii': ParamLink(['voxelization', 'radii'], self.tab.voxelizationRadiusTriplet),
+            'voxelization_weights': ParamLink(['voxelization', 'weights'], self.tab.voxelizationWeightsComboBox),
             'crop_x': VectorLink(['detection', 'test_set_slicing', 'dim_0'], self.tab.detectionSubsetXRangeDoublet),
             'crop_y': VectorLink(['detection', 'test_set_slicing', 'dim_1'], self.tab.detectionSubsetYRangeDoublet),
             'crop_z': VectorLink(['detection', 'test_set_slicing', 'dim_2'], self.tab.detectionSubsetZRangeDoublet),
@@ -1356,13 +1386,16 @@ class VesselParams(ChannelsUiParameterCollection):
                                                                        get_view=get_view,
                                                                        apply_patch=apply_patch)
         self.graph_params = VesselGraphParams(tab, event_bus=event_bus, get_view=get_view, apply_patch=apply_patch)
+        self.graph_perf_params = VesselGraphPerformanceParams(tab, event_bus=event_bus, get_view=get_view, apply_patch=apply_patch)
         self.visualization_params = VesselVisualizationParams(tab, sample_params=sample_params, event_bus=event_bus,
                                                                 get_view=get_view, apply_patch=apply_patch)
         self._perf_params: dict[str, VesselBinarizationPerformanceParams] = {}
 
     @property
     def params(self):
-        return list(self.values()) + [self.graph_params, self.visualization_params] + list(self._perf_params.values())
+        return (list(self.values()) +
+                [self.graph_params, self.graph_perf_params, self.visualization_params] +
+                list(self._perf_params.values()))
 
     def get_selected_steps_and_channels(self):
         shared_params = self.shared_binarization_params
@@ -1418,7 +1451,6 @@ class VesselBinarizationParams(ChannelUiParameter):
     def build_params_dict(self):
         return {
             # FIXME: add tabs to UI with matching control names
-            'run_binarization': ParamLink(['binarize', 'run'], self.tab.runBinarizationCheckBox),
             'binarization_clip_range': ParamLink(['binarize', 'clip_range'], self.tab.binarizationClipRangeDoublet),
             'binarization_threshold': ParamLink(['binarize','threshold'],
                                                 self.tab.binarizationThresholdSpinBox,
@@ -1428,22 +1460,103 @@ class VesselBinarizationParams(ChannelUiParameter):
                                                 # cast_to_ui=self.sanitize_nones,  # REFACTOR: use VectorLink instead ?
                                                 # cast_from_ui=self.sanitize_neg_one
                                                 ),
-            'run_smoothing': ParamLink(['smooth', 'run'], self.tab.binarizationSmoothingCheckBox),
-            'run_binary_filling': ParamLink(['binary_fill', 'run'], self.tab.binarizationBinaryFillingCheckBox),
-            'run_deep_filling': ParamLink(['deep_fill', 'run'], self.tab.binarizationDeepFillingCheckBox),
         }
-        # self.tab.binarizationControlsGroupBox.setTitle(channel_name)
 
     @property
     def cfg_subtree(self):
         return ['vasculature', 'binarization', 'single_channels', self.name]   # REFACTOR: section name from config_handler
 
+    def cfg_to_ui(self) -> None:
+        super().cfg_to_ui()
+        # Sync pipeline widget from config — runs even during hydration
+        if self._pipeline_widget is not None:
+            self.widget_ops.set(self._pipeline_widget, self._pipeline_state_from_cfg(), silent=True)
+
+    @property
+    def _pipeline_widget(self) -> Optional['LinearPipelineWidget']:
+        """The LinearPipelineWidget attached to this channel's page widget."""
+        return getattr(self.tab, 'binarizationPipelineWidget', None)
+
+    def _pipeline_state_from_cfg(self) -> dict:
+        """Build the config-schema dict that _lp_setter expects."""
+        cfg = self.view
+        order = cfg.get('step_order') or list(BINARIZATION_STEPS.keys())
+        return {
+            'step_order': order,
+            **{name: {'run': cfg.get(name, {}).get('run', True),
+                      'keep_intermediate': cfg.get(name, {}).get('save', True),}
+               for name in order if name in BINARIZATION_STEPS}
+        }
+
+    def pipeline_from_config(self) -> 'LinearPipeline':
+        """
+        Reconstruct a LinearPipeline from config run flags and step_order.
+        Falls back to BINARIZATION_STEPS insertion order when step_order
+        is absent (e.g. legacy config).
+        """
+        cfg = self.view
+        order = cfg.get('step_order') or list(BINARIZATION_STEPS.keys())
+        steps = []
+        for name in order:
+            if name not in BINARIZATION_STEPS:
+                continue
+            enabled = cfg.get(name, {}).get('run', True)
+            keep_intermediate = cfg.get(name, {}).get('save', True)
+            position_locked = (name == 'binarize')   # binarize must always come first  #  FIXME: use BINARIZATION_STEPS metadata for this instead of hardcoding
+            steps.append(PipelineStep(spec_name=name, enabled=enabled,
+                                      keep_intermediate=keep_intermediate, locked=position_locked))
+        return LinearPipeline(steps=steps)
+
+    def apply_pipeline_to_config(self, pipeline: 'LinearPipeline') -> None:
+        """
+        Write step order and enabled flags from pipeline to config.
+        Called by the tab whenever the pipeline widget changes.
+        """
+        patch = {}
+        for step in pipeline.steps:
+            set_item_recursive(patch,
+                               self.cfg_subtree + [step.spec_name, 'run'], step.enabled)
+            set_item_recursive(patch,
+                               self.cfg_subtree + [step.spec_name, 'save'], step.keep_intermediate)
+        set_item_recursive(patch,
+                           self.cfg_subtree + ['step_order'], [s.spec_name for s in pipeline.steps])
+        self._apply_patch(patch)
+
+    def post_connect(self) -> None:
+        """
+        Create and wire the LinearPipelineWidget after ParamLink connections
+        are established. The widget replaces the run_* checkboxes and is
+        owned here because it drives config writes via apply_pipeline_to_config.
+        """
+        # Build initial state from config (handles hydration correctly)
+        pipeline = self.pipeline_from_config()
+
+        # Build and insert widget
+        pipeline_widget = LinearPipelineWidget(pipeline, parent=self.tab)
+        self.tab.binarizationPipelineWidget = pipeline_widget
+        ctrl_box = self.tab.binarizationStepsGroupBox
+        ctrl_box.layout().insertWidget(0, pipeline_widget)
+
+        # Register in params_dict for cfg_to_ui (WIDGET_OPS.set) and teardown
+        # connect=False because keys=None
+        p_link = ParamLink(keys=None, widget=pipeline_widget)
+        self.params_dict['pipeline'] = p_link
+
+        # Force save to add section if missing
+        self.apply_pipeline_to_config(pipeline_widget.pipeline)
+
+        # Wire change → config write; store disconnector so teardown() cleans up
+        callback = lambda: self.apply_pipeline_to_config(pipeline_widget.pipeline)
+        disconnector = _linear_pipeline_connector(pipeline_widget, callback)
+        p_link.add_disconnector(disconnector)
+
     @property
     def n_steps(self):
-        n_steps = self.run_binarization
-        n_steps += self.run_smoothing or self.run_binary_filling
-        n_steps += self.run_deep_filling
-        return n_steps
+        if self._pipeline_widget is not None:
+            return len(self._pipeline_widget.pipeline.enabled_steps)
+        # fallback before widget exists (e.g. before hydration)
+        return len([stp for stp in BINARIZATION_STEPS if self.view.get(stp, {}).get('run', True)])
+
 
 class VesselBinarizationPerformanceParams(ChannelUiParameter):
     n_processes: int
@@ -1489,6 +1602,7 @@ class VesselGraphParams(UiParameter):
 
     cfg_subtree = ['vasculature']
 
+    # graph_construction
     skeletonize: bool
     build: bool
     clean: bool
@@ -1496,15 +1610,26 @@ class VesselGraphParams(UiParameter):
     transform: bool
     annotate: bool
     use_arteries: bool
+
+    # pre_filtering
     vein_intensity_range_on_arteries_channel: List[int]
     restrictive_min_vein_radius: float
     permissive_min_vein_radius: float
     final_min_vein_radius: float
-    arteries_min_radius: float
+    arteries_min_noise_edges: int
+
+    # tracing
     max_arteries_tracing_iterations: int
     max_veins_tracing_iterations: int
-    min_artery_size: int
-    min_vein_size: int
+    artery_trace_radius_um: float
+    vein_trace_radius_um: float
+    distance_to_surface_min: float
+    artery_intensity_min: float
+    vein_intensity_min: float
+
+    # capillaries_removal
+    min_artery_component_edges: int
+    min_vein_component_edges: int
 
     def __init__(self, tab, *, event_bus: EventBus, get_view=None, apply_patch=None):
         super().__init__(tab, event_bus=event_bus, get_view=get_view, apply_patch=apply_patch)
@@ -1518,35 +1643,53 @@ class VesselGraphParams(UiParameter):
             'reduce': ParamLink(['graph_construction', 'reduce'], self.tab.buildGraphReduceCheckBox),
             'transform': ParamLink(['graph_construction', 'transform'], self.tab.buildGraphTransformCheckBox),
             'annotate':  ParamLink(['graph_construction', 'annotate'], self.tab.buildGraphRegisterCheckBox),
-            'use_arteries': ParamLink(
-                ['graph_construction', 'use_arteries'],
-                self.tab.buildGraphUseArteriesCheckBox),
+            'use_arteries': ParamLink(['graph_construction', 'use_arteries'],
+                                      self.tab.buildGraphUseArteriesCheckBox),
+
             'vein_intensity_range_on_arteries_channel': ParamLink(
                 ['vessel_type_postprocessing', 'pre_filtering', 'vein_intensity_range_on_arteries_ch'],
                 self.tab.veinIntensityRangeOnArteriesChannelDoublet),
             'restrictive_min_vein_radius': ParamLink(
-                ['vessel_type_postprocessing', 'pre_filtering', 'restrictive_vein_radius'],
+                ['vessel_type_postprocessing', 'pre_filtering', 'restrictive_vein_radius_um'],
                 self.tab.restrictiveMinVeinRadiusDoubleSpinBox),
             'permissive_min_vein_radius': ParamLink(
-                ['vessel_type_postprocessing', 'pre_filtering', 'permissive_vein_radius'],
+                ['vessel_type_postprocessing', 'pre_filtering', 'permissive_vein_radius_um'],
                 self.tab.permissiveMinVeinRadiusDoubleSpinBox),
             'final_min_vein_radius': ParamLink(
-                ['vessel_type_postprocessing', 'pre_filtering', 'final_vein_radius'],
+                ['vessel_type_postprocessing', 'pre_filtering', 'final_vein_radius_um'],
                 self.tab.finalMinVeinRadiusDoubleSpinBox),
-            'arteries_min_radius': ParamLink(
-                ['vessel_type_postprocessing', 'pre_filtering', 'arteries_min_radius'],
-                self.tab.arteriesMinRadiusDoubleSpinBox),
+            'arteries_min_noise_edges': ParamLink(
+                ['vessel_type_postprocessing', 'pre_filtering', 'arteries_min_noise_edges'],
+                self.tab.arteriesMinComponentEdgesSpinBox),
+
             'max_arteries_tracing_iterations': ParamLink(
                 ['vessel_type_postprocessing', 'tracing', 'max_arteries_iterations'],
                 self.tab.maxArteriesTracingIterationsSpinBox),
             'max_veins_tracing_iterations': ParamLink(
                 ['vessel_type_postprocessing', 'tracing', 'max_veins_iterations'],
                 self.tab.maxVeinsTracingIterationsSpinBox),
-            'min_artery_size': ParamLink(
-                ['vessel_type_postprocessing', 'capillaries_removal', 'min_artery_size'],
-                self.tab.minArterySizeSpinBox),  # WARNING: not the same unit as below
-            'min_vein_size': ParamLink(['vessel_type_postprocessing', 'capillaries_removal', 'min_vein_size'],
-                                       self.tab.minVeinSizeDoubleSpinBox)
+            'artery_trace_radius_um': ParamLink(
+                ['vessel_type_postprocessing', 'tracing', 'artery_trace_radius_um'],
+                self.tab.arteryTraceRadiusDoubleSpinBox),
+            'vein_trace_radius_um': ParamLink(
+                ['vessel_type_postprocessing', 'tracing', 'vein_trace_radius_um'],
+                self.tab.veinTraceRadiusDoubleSpinBox),
+            'vein_intensity_min': ParamLink(
+                ['vessel_type_postprocessing', 'tracing', 'vein_intensity_min'],
+                self.tab.veinIntensityMinSpinBox),
+            'distance_to_surface_min': ParamLink(
+                ['vessel_type_postprocessing', 'tracing', 'distance_to_surface_min'],
+                self.tab.arteryDistanceToSurfaceMinDoubleSpinBox),
+            'artery_intensity_min': ParamLink(
+                ['vessel_type_postprocessing', 'tracing', 'artery_intensity_min'],
+                self.tab.arteryIntensityMinDoubleSpinBox),
+
+            'min_artery_component_edges': ParamLink(
+                ['vessel_type_postprocessing', 'capillaries_removal', 'min_artery_component_edges'],
+                self.tab.arteryMinComponentEdgesSpinBox),
+            'min_vein_component_edges': ParamLink(
+                ['vessel_type_postprocessing', 'capillaries_removal', 'min_vein_component_edges'],
+                self.tab.veinsMinComponentEdgesSpinBox)
         }
 
     def add_graph_filter_params(self, widget, graph):
@@ -1570,6 +1713,28 @@ class VesselGraphParams(UiParameter):
         #           parts.append(op)
         #   suffix = '_'.join(parts)
         return suffix
+
+
+class VesselGraphPerformanceParams(UiParameter):
+    """
+    Graph construction performance parameters.
+    Global — graph operates on the combined binary, not per-channel.
+    Widgets are created dynamically in VasculatureTab._setup_graph_perf()
+    before VesselParams is instantiated.
+    """
+    cfg_subtree = ['vasculature', 'performance', 'graph_construction']
+
+    def build_params_dict(self) -> dict:
+        return {
+            'skeletonize_n_processes': ParamLink(['skeletonize', 'n_processes'],
+                                                 self.tab.skeletonizeNProcessesWidget),
+            'build_n_processes': ParamLink(['build', 'n_processes'],
+                                           self.tab.buildGraphNProcessesWidget),
+            'clean_n_processes': ParamLink(['clean', 'n_processes'],
+                                           self.tab.cleanGraphNProcessesWidget),
+            'reduce_n_processes': ParamLink(['reduce', 'n_processes'],
+                                            self.tab.reduceGraphNProcessesWidget),
+        }
 
 
 class GraphFilterParams(UiParameter):  # FIXME: do we really pass the graph as argument or just the prop names/types ?
@@ -1830,15 +1995,15 @@ class BatchParameters(UiParameter):
 
     # IMPORTANT: implement in subclass
     def build_params_dict(self) -> dict:
-        return {'results_folder': ParamLink(['paths', 'results_folder'], self.tab.resultsFolderLineEdit,
-                                            notify_apply=lambda: self.publish(UiBatchResultsFolderChanged(self.results_folder))),
-                'groups': ParamLink(['groups'], self.groups_adapter,
-                                    connect=False)#notify_apply=lambda: self.publish(UiBatchGroupsChanged(self.groups)))
-                }
+        return {
+            'results_folder': ParamLink(['paths', 'results_folder'], self.tab.resultsFolderLineEdit,
+                                        notify_apply=lambda: self.publish(UiBatchResultsFolderChanged(self.results_folder))),
+            'groups': ParamLink(['groups'], self.groups_adapter,
+                                connect=False)#notify_apply=lambda: self.publish(UiBatchGroupsChanged(self.groups)))
+        }
 
     def connect(self):
         self.groups_adapter.connect(self._on_groups_widget_changed)
-
 
     @param_handler
     def _on_groups_widget_changed(self, *_):
@@ -1912,9 +2077,10 @@ class GroupAnalysisParams(BatchParameters):
         self.extend_params_dict({
             # 'plot_channel': ParamLink(None, self.tab.plotChannelComboBox),
             'compute_sd_and_effect_size': ParamLink(None, self.tab.computeSdAndEffectSizeCheckBox),
-            'density_suffix': ParamLink(None, self.tab.densitySuffixTextFilterLineEdit),
+            'density_suffix': ParamLink(None, self.tab.densitySuffixComboBox),
             'pipeline': ParamLink(['pipeline'], self.tab.batchPipelineNameComboBox)
         })
+        self.tab.densitySuffixComboBox.setEditable(True)
 
         self._cmp_model = ComparisonsModel(sep=self.group_concatenator)
         self._cmp_ui = ComparisonsWidgetAdapter(self.tab.comparisonsVerticalLayout,
@@ -1922,6 +2088,8 @@ class GroupAnalysisParams(BatchParameters):
 
         # FIXME: do I want this ?
         self._channels_provider: Optional[Callable[[], list[str]]] = None
+        self._suffixes_provider: Optional[Callable[[], list[str]]] = None
+
         self._on_plot_group: Optional[Callable[[str], None]] = None
 
         self.plot_channel = ''
@@ -1954,6 +2122,9 @@ class GroupAnalysisParams(BatchParameters):
     def set_channels_provider(self, provider: Callable[[], list[str]]):
         self._channels_provider = provider
 
+    def set_suffixes_provider(self, provider: Callable[[], list[str]]):
+        self._suffixes_provider = provider
+
     def set_on_plot_group(self, handler: Callable[[str], None]):
         self._on_plot_group = handler
 
@@ -1963,7 +2134,9 @@ class GroupAnalysisParams(BatchParameters):
     def _rebuild_comparisons_core(self, *, preselected: Optional[list[Pair]] = None):
         self._cmp_model.group_names = list(self.group_names)
         self._cmp_model.selected = preselected or []
+
         channels = self._channels_provider() if callable(self._channels_provider) else []
+        suffixes = self._suffixes_provider() if callable(self._suffixes_provider) else []
 
         def _on_channel_changed(ch: str):
             self.plot_channel = ch
@@ -1971,10 +2144,11 @@ class GroupAnalysisParams(BatchParameters):
         self._cmp_ui.rebuild(self._cmp_model,
                              on_plot_group=(self._on_plot_group or (lambda _g: None)),
                              channels=channels, on_channel_changed=_on_channel_changed,
-                             preselected_comparisons=self._cmp_model.selected,)
+                             suffixes=suffixes,
+                             preselected_comparisons=self._cmp_model.selected)
+
         if channels and not self.plot_channel:
             self.plot_channel = channels[0]
-
     @property
     def comparisons(self) -> list[Pair]:
         return self._cmp_model.all_pairs()

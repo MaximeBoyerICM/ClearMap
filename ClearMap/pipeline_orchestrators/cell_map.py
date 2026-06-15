@@ -24,33 +24,31 @@ import re
 import platform
 import warnings
 from concurrent.futures.process import BrokenProcessPool
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 
-import pyqtgraph as pg
-from matplotlib.colors import to_hex
+# noinspection PyPep8Naming
+import ClearMap.IO.IO as clearmap_io
+from ClearMap.IO.workspace2 import Workspace2
 
 # noinspection PyPep8Naming
 import ClearMap.Alignment.Elastix as elastix
-# noinspection PyPep8Naming
-import ClearMap.IO.IO as clearmap_io
-# noinspection PyPep8Naming
-import ClearMap.Visualization.Plot3d as plot_3d
-import ClearMap.Visualization.Qt.Plot3d as qplot_3d
 # noinspection PyPep8Naming
 import ClearMap.Alignment.Resampling as resampling
 # noinspection PyPep8Naming
 import ClearMap.ImageProcessing.Experts.Cells as cell_detection
 # noinspection PyPep8Naming
 import ClearMap.Analysis.Measurements.Voxelization as voxelization
-from ClearMap.IO.workspace2 import Workspace2
+
 from ClearMap.Utils.exceptions import MissingRequirementException
 from ClearMap.Utils.utilities import requires_assets, FilePath, sanitize_n_processes
+
 from ClearMap.config.config_coordinator import ConfigCoordinator
+
 from ClearMap.pipeline_orchestrators.generic_orchestrators import ChannelPipelineOrchestrator
-from ClearMap.Visualization.Qt.widgets import Scatter3D
+
 
 __author__ = 'Christoph Kirst <christoph.kirst.ck@gmail.com>, Charly Rousseau <charly.rousseau@icm-institute.org>'
 __license__ = 'GPLv3 - GNU General Public License v3 (see LICENSE)'
@@ -60,6 +58,9 @@ __download__ = 'https://github.com/ClearAnatomics/ClearMap'
 
 from ClearMap.pipeline_orchestrators.sample_info_management import SampleManager
 from ClearMap.pipeline_orchestrators.registration_orchestrator import RegistrationProcessor
+
+if TYPE_CHECKING:
+    from PyQt5.QtWidgets import QWidget
 
 USE_BINARY_POINTS_FILE = not platform.system().lower().startswith('darwin')
 
@@ -111,7 +112,13 @@ class CellDetector(ChannelPipelineOrchestrator):
             raise ValueError('CellDetector not properly initialized')
         self.patch_channel({'voxelization': {'radii': list(voxelization_radii)}})
 
-    def voxelize(self, sub_step=''):
+    def list_valid_weighing_columns(self, sub_step=''):
+        aligned = sub_step != ''
+        cells_df = self.get_coords(coord_type=sub_step, aligned=aligned)
+        excluded_columns = {'id', 'name', 'order', 'color', 'volume'}
+        return set(cells_df.columns) - excluded_columns
+
+    def voxelize(self, sub_step='', weights_column=None):        # FIXME: add uncrusting ?
         """
         Unweighted voxelization (i.e. cell counts)
         This will draw a sphere of radius r around each cell and increment the voxel values.
@@ -120,12 +127,38 @@ class CellDetector(ChannelPipelineOrchestrator):
         ----------
         sub_step: str
             If specified, will use the coordinates from the specified sub_step (e.g. 'aligned')
+        weights_column: str
+            If specified, this column in the cells table will be used to add weights to the
+            voxelization spheres (e.g. for intensity voxelization).
+            The column must be present in the cells table.
+
+        Returns
+        -------
+            coordinates, counts_file_path: np.array, str
         """
+        if weights_column not in self.list_valid_weighing_columns(sub_step=sub_step):
+            raise ValueError(f'Column {weights_column} is invalid. '
+                             f'Valid options are {self.list_valid_weighing_columns(sub_step)}')
         coordinates, cells, voxelization_parameter = self.get_voxelization_params(sub_step=sub_step)
-        _ = self.voxelize_unweighted(coordinates, voxelization_parameter)
+
+        title = 'Voxelisation'
+        suffix = 'counts'
+        weights = None
+        if weights_column:
+            suffix += f'_{weights_column}'
+            title += f' weighted by {weights_column}'
+            weights = self.get_cells_df()[weights_column]
+        counts_asset = self.get('density', channel=self.channel, asset_sub_type=suffix)
+        counts_asset.delete(missing_ok=True)  # Remove previous counts file if exists
+        self.set_watcher_step(title)
+
+        voxelization.voxelize(coordinates, sink=counts_asset.path, weights=weights, **voxelization_parameter)  # WARNING: prange
+        self.update_watcher_main_progress()
+        return coordinates, counts_asset.path
 
     @requires_assets([FilePath('density', asset_sub_type='counts')])
     def plot_voxelized_counts(self, arrange=True, parent=None):
+        import ClearMap.Visualization.Plot3d as plot_3d
         scale = self.channel_cfg_view('registration')['resampled_resolution']
         return plot_3d.plot(self.get_path('density', channel=self.channel, asset_sub_type='counts'),
                             scale=scale, title='Cell density (voxelized)', lut='flame',
@@ -175,48 +208,6 @@ class CellDetector(ChannelPipelineOrchestrator):
         coordinates = np.array([table[axis] for axis in axes]).T  # .T for (n, axes)
         return table, coordinates
 
-    def voxelize_unweighted(self, coordinates, voxelization_parameter):
-        """
-        Voxelize un weighted i.e. for cell counts
-
-        Parameters
-        ----------
-        coordinates: str, array or Source
-            Source of point of nxd coordinates.
-        voxelization_parameter:  dict
-            Dictionary to be passed to voxelization.voxelise (i.e. with these optional keys:
-                shape, dtype, weights, method, radius, kernel, processes, verbose
-
-        Returns
-        -------
-        coordinates, counts_file_path: np.array, str
-        """
-        counts_asset = self.get('density', channel=self.channel, asset_sub_type='counts')
-        counts_asset.delete(missing_ok=True)  # Remove previous counts file if exists
-        self.set_watcher_step('Unweighted voxelisation')
-        voxelization.voxelize(coordinates, sink=counts_asset.path, **voxelization_parameter)  # WARNING: prange
-        self.update_watcher_main_progress()
-        # uncrusted_coordinates = self.remove_crust(coordinates)  # WARNING: currently causing issues
-        #         density_path = self.get_path('density', channel=self.channel, asset_sub_type='counts_wcrust')
-        #         voxelization.voxelize(uncrusted_coordinates, sink=density_path, **voxelization_parameter)   # WARNING: prange
-        return coordinates, counts_asset.path
-
-    def voxelize_weighted(self, coordinates, source, voxelization_parameter):
-        """
-        Voxelize weighted i.e. for cell intensities
-
-        Parameters
-        ----------
-        coordinates: np.array
-        source: Source.Source
-        voxelization_parameter: dict
-        """
-        intensities_asset = self.get('density', channel=self.channel, asset_sub_type='intensities')
-        intensities_asset.delete(missing_ok=True)  # Remove previous intensities file if exists
-        intensities = source['source']
-        voxelization.voxelize(coordinates, sink=intensities_asset.path, weights=intensities, **voxelization_parameter)   # WARNING: prange
-        return intensities_asset.path
-
     def atlas_align(self):
         """Atlas alignment and annotation """
         table, coordinates = self.get_coords(coord_type='filtered')
@@ -261,7 +252,7 @@ class CellDetector(ChannelPipelineOrchestrator):
 
         return coords
 
-    def filter_cells(self):
+    def filter_cells(self, distance_from_surface_px: int = 0):
         thresholds = {
             'source': self.config['cell_filtration']['thresholds']['intensity'],
             'size': self.config['cell_filtration']['thresholds']['size']
@@ -272,6 +263,12 @@ class CellDetector(ChannelPipelineOrchestrator):
                                               f' cannot filter cells. Please run cell detection first.')
         dest_path = self.get_path('cells', channel=self.channel, asset_sub_type='filtered')
         cell_detection.filter_cells(source=src_path, sink=dest_path, thresholds=thresholds)
+        if distance_from_surface_px > 0:
+            table, filtered_coords = self.get_coords(coord_type='filtered')
+            uncrusted_coords, mask = self.remove_crust(coordinates=filtered_coords,
+                                                       threshold=distance_from_surface_px, return_mask=True)
+            table = table[mask]
+            clearmap_io.write(dest_path, table)  # Overwrite filtered with uncrusted
 
     def run_cell_detection(self, tuning=False, save_maxima=False, save_shape=False, save_as_binary_mask=False):
         self.workspace.debug = tuning  # TODO: use context manager
@@ -374,7 +371,7 @@ class CellDetector(ChannelPipelineOrchestrator):
                 self.get_path('atlas', channel=self.channel, asset_sub_type='hemispheres')
             )
             tmp['Structure volume'] = tmp.set_index(['Structure ID', 'Hemisphere']).index.map(vol_map.get)
-            order_map = {id_: annotator.find(id_, key='id')['order'] for id_ in uniq_ids}
+            order_map = {int(id_): annotator.find(id_, key='id')['order'] for id_ in uniq_ids}
             tmp['Structure order'] = tmp['Structure ID'].map(order_map)
             collapsed = tmp.merge(collapsed[['Structure ID', 'Hemisphere', 'Cell counts', 'Average cell size']],
                                   how='left', on=['Structure ID', 'Hemisphere'])
@@ -385,6 +382,11 @@ class CellDetector(ChannelPipelineOrchestrator):
         collapsed.to_csv(csv_file_path, index=False)
 
     def plot_cells_3d_scatter_w_atlas_colors(self, raw=False, parent=None):
+        import ClearMap.Visualization.Qt.Plot3d as qplot_3d
+        from ClearMap.Visualization.Qt.widgets import Scatter3D
+        import pyqtgraph as pg
+        from matplotlib.colors import to_hex
+
         asset_properties = {'channel': self.channel}
         if raw:
             asset_properties['asset_type'] = 'stitched'
@@ -397,10 +399,11 @@ class CellDetector(ChannelPipelineOrchestrator):
                 return
 
         asset = self.get(**asset_properties)
-        if not asset.exists or not self.df_path.exists:
-            raise MissingRequirementException(f'plot_cells_3d_scatter_w_atlas_colors missing files:'
-                                              f'image: {asset.path} {"not" if not asset.exists else ""} found'
-                                              f'cells data frame {"not" if not self.df_path.exists else ""} found')
+        requirements = [asset, self.df_path]
+        if any(not req.exists for req in requirements):
+            raise MissingRequirementException(f'Cannot plot 3D scatter with atlas colors',
+                                              missing_items=[e for e in requirements if not e.exists],
+                                              found_items=[e for e in requirements if e.exists])
         dv = qplot_3d.plot(asset.path, title=f'{asset_properties["asset_type"].title()} and cells',  # FIXME: correct scaling for anisotropic if raw
                            arrange=False, lut='white', parent=parent)[0]
 
@@ -436,7 +439,8 @@ class CellDetector(ChannelPipelineOrchestrator):
 
         particle_size = self.config['detection']['background_correction']['diameter'][0]
         dv.scatter_coords = Scatter3D(coordinates, colors=df['color'].to_list(),
-                                      hemispheres=hemispheres, half_slice_thickness=0,
+                                      hemispheres=hemispheres,
+                                      half_slice_thickness=self.machine_config['particle_plot_z_sphere_radius'],
                                       marker_size=max(3, particle_size // 2))
         dv.refresh()
         return [dv]
@@ -458,6 +462,10 @@ class CellDetector(ChannelPipelineOrchestrator):
 
     @requires_assets([FilePath('cells', asset_sub_type='filtered'), FilePath('stitched')])
     def plot_filtered_cells(self, parent=None, smarties=False):
+        import ClearMap.Visualization.Qt.Plot3d as qplot_3d
+        from ClearMap.Visualization.Qt.widgets import Scatter3D
+        import pyqtgraph as pg
+
         _, coordinates = self.get_coords('filtered')
         stitched_path = self.get_path('stitched', channel=self.channel)
         dv = qplot_3d.plot(stitched_path, title='Stitched and filtered cells', arrange=False,
@@ -472,6 +480,7 @@ class CellDetector(ChannelPipelineOrchestrator):
         return [dv]
 
     def plot_background_subtracted_img(self):
+        import ClearMap.Visualization.Plot3d as plot_3d
         src = self.get('cells', channel=self.channel, asset_sub_type='raw').as_source()
         coordinates = np.hstack([src[c][:, None] for c in 'xyz'])
         p = plot_3d.list_plot_3d(coordinates)
@@ -499,7 +508,8 @@ class CellDetector(ChannelPipelineOrchestrator):
         else:
             return uncrusted_coordinates
 
-    def preview_cell_detection(self, parent=None, arrange=True, sync=True):
+    def preview_cell_detection(self, parent: Optional['QWidget'] = None, arrange: bool = True, sync: bool = True) -> list:
+        import ClearMap.Visualization.Plot3d as plot_3d
         sources = [
             self.get_path('stitched', channel=self.channel),
             self.get_path('cells', channel=self.channel, asset_sub_type='bkg'),
@@ -527,6 +537,7 @@ class CellDetector(ChannelPipelineOrchestrator):
             return 0
 
     def plot_voxelized_intensities(self, arrange=True):
+        import ClearMap.Visualization.Plot3d as plot_3d
         density_path = self.get_path('density', channel=self.channel, asset_sub_type='intensities')
         return plot_3d.plot(density_path, arrange=arrange)
 

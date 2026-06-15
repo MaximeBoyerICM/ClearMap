@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from packaging.version import Version
 
+from ClearMap.config.change_detection import (channels_added_or_removed, channel_data_type_changed,
+                                              whole_sample_changed, channels_with_changed_property,
+                                              channel_path_changed, IRRELEVANT_DATA_TYPES)
 from ClearMap.config.convert_config_versions import convert_versions
+from ClearMap.gui.exception_handler import install_global_handler
 
 """
 app
@@ -57,7 +61,7 @@ from statistics import mode
 print('Importing PyQt5...', flush=True)
 from PyQt5 import QtGui
 from PyQt5.QtGui import QGuiApplication
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QBuffer
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton, QSpinBox, QDoubleSpinBox,
                              QComboBox, QLineEdit, QMessageBox, QToolBox, QProgressBar, QLabel,
                              QStyle, QAction, QDockWidget)
@@ -741,6 +745,7 @@ class ClearMapApp(ClearMapAppBase):
         self.actionStructureSelector.triggered.connect(self.structure_selector.show)
 
         self.amend_ui()
+        self._init_drag_drop()
         self.setup_monitoring_bars()
         self.app = QApplication.instance() # noqa
 
@@ -755,12 +760,36 @@ class ClearMapApp(ClearMapAppBase):
         self.ortho_viewer = cmp_widgets.OrthoViewer()
 
         self._init_sample_tab_mgr()
-
+        self.gui_controller._needs_tab_reset = True  # Will clear tabs on next call
         self.amend_ui()
 
-    def _select_experiment_mode(self):
+    def _infer_mode_from_folder(self, folder: Path) -> tuple[AppMode, Path]:
+        """
+        Heuristic:
+          - folder itself has a sample config  → EXPERIMENT
+          - folder contains sub-experiments    → GROUP
+          - neither                            → EXPERIMENT (new/unconfigured)
+
+        Returns (mode, effective_root) where effective_root is the
+        folder to pass to the respective setup method.
+        """
+        # Already an experiment folder
+        if ConfigHandler(folder).get_local_canonical_path('sample').exists():
+            return AppMode.EXPERIMENT, folder
+
+        # Batch: contains sub-experiments
+        exp_roots = scan_folder_for_experiments(folder)
+        if exp_roots:
+            return AppMode.GROUP, folder
+
+        # Unconfigured new experiment
+        return AppMode.EXPERIMENT, folder
+
+    def _select_experiment_mode(self, exp_dir=None):
         self.gui_controller.set_mode(AppMode.EXPERIMENT)
         self.centralStack.setCurrentIndex(1)  # tabs page
+        if exp_dir:
+            self._set_src_folder(str(exp_dir))
 
     def _read_exp_version(self, exp_dir: Path) -> Version | None:
         loader = ConfigHandler(exp_dir)
@@ -771,10 +800,11 @@ class ClearMapApp(ClearMapAppBase):
         v = cfg.get('clearmap_version')
         return Version(str(v)) if v else None
 
-    def _select_group_mode(self):
-        base = self.preference_editor.params.start_folder
-        group_dir = ClearMap.gui.dialog_helpers.get_directory_dlg(
-            base, title='Select cohort folder (contains experiment folders)')
+    def _select_group_mode(self, group_dir=None):
+        if not group_dir:
+            base = self.preference_editor.params.start_folder
+            group_dir = ClearMap.gui.dialog_helpers.get_directory_dlg(
+                base, title='Select cohort folder (contains experiment folders)')
         if not group_dir:
             return
 
@@ -807,6 +837,75 @@ class ClearMapApp(ClearMapAppBase):
         # 2) switch mode
         self.gui_controller.set_mode(AppMode.GROUP)
         self.centralStack.setCurrentIndex(1)  # tabs page
+
+    def _init_drag_drop(self):
+        lbl = self.dragAndDropLabel
+
+        # ---- static style: dashed border, centered, subdued ----
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setWordWrap(True)
+
+        # Folder icon above the text via rich-text (uses built-in Qt icon)
+        folder_icon = self.style().standardIcon(QStyle.SP_DirOpenIcon)
+        pixmap = folder_icon.pixmap(32, 32)
+        # Embed as base64 so we can put it inline in the label HTML
+        buf = QBuffer()
+        buf.open(QBuffer.WriteOnly)
+        pixmap.save(buf, 'PNG')
+        icon_b64 = bytes(buf.data().toBase64()).decode()
+
+        lbl.setText(
+            f'<center>'
+            f'<img src="data:image/png;base64,{icon_b64}" width="32" height="32"/><br/>'
+            f'<span style="font-size:11pt; color:#aaa;">Drop experiment or cohort folder here</span>'
+            f'</center>'
+        )
+
+        self._drop_idle_style = """
+            QLabel {
+                border: 2px dashed #555;
+                border-radius: 8px;
+                background: transparent;
+                padding: 18px;
+                color: #aaa;
+            }
+        """
+        self._drop_hover_style = """
+            QLabel {
+                border: 2px dashed #74c69d;
+                border-radius: 8px;
+                background: rgba(116, 198, 157, 0.08);
+                padding: 18px;
+                color: #74c69d;
+            }
+        """
+        lbl.setStyleSheet(self._drop_idle_style)
+
+        lbl.setAcceptDrops(True)
+        lbl.dragEnterEvent = self._on_drag_enter
+        lbl.dragLeaveEvent = self._on_drag_leave
+        lbl.dropEvent = self._on_drop
+
+    def _on_drag_enter(self, event):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if len(urls) == 1 and Path(urls[0].toLocalFile()).is_dir():
+                self.dragAndDropLabel.setStyleSheet(self._drop_hover_style)
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def _on_drag_leave(self, event):
+        self.dragAndDropLabel.setStyleSheet(self._drop_idle_style)
+
+    def _on_drop(self, event):
+        self.dragAndDropLabel.setStyleSheet(self._drop_idle_style)
+        urls = event.mimeData().urls()
+        if urls:
+            folder = Path(urls[0].toLocalFile())
+            if folder.is_dir():
+                self._open_dropped_folder(folder)
+                event.acceptProposedAction()
 
     @property
     def sample_manager(self):
@@ -1078,6 +1177,13 @@ class ClearMapApp(ClearMapAppBase):
         self.print_status_msg(f'Cloned config from {folder_to_clone} to {self.src_folder}')
         return True
 
+    def _open_dropped_folder(self, folder: Path):
+        mode, root = self._infer_mode_from_folder(folder)
+        if mode == AppMode.EXPERIMENT:
+            self._select_experiment_mode(root)
+        else:
+            self._select_group_mode(group_dir=root)  # Already parametrized, bypass dlg
+
     def prompt_experiment_folder(self):
         """Prompt the user for the main experiment data folder and set it"""
         folder = ClearMap.gui.dialog_helpers.get_directory_dlg(self.preference_editor.params.start_folder)
@@ -1121,6 +1227,19 @@ class ClearMapApp(ClearMapAppBase):
             #
             # splash.finish(self)
         self.manage_assets()
+
+    def trigger_workspace_reset(self):
+        """Delete workspace.yml and reload the experiment."""
+        if not self.src_folder:
+            return
+        ws_path = Path(self.src_folder) / 'workspace.yml'
+        if ws_path.exists():
+            ws_path.unlink()
+            self.print_status_msg(f'Removed {ws_path}')
+
+        # Re-open the experiment (will recreate workspace from configs)
+        self.reset()
+        self._set_src_folder(str(self.src_folder))
 
     def _prompt_sample_id(self):
         """
@@ -1176,9 +1295,10 @@ class GuiController(BusSubscriberMixin):
     def __init__(self, bus: EventBus, experiment, tab_registry: TabRegistry,
                  group_controller: AnalysisGroupController):
         super().__init__(bus)
-        self._hydrating = False
+        self._needs_tab_reset: bool = False
+        self._hydrating: bool = False
         self.experiment_controller: ExperimentController = experiment
-        self.tabs_registry: TabRegistry = tab_registry  # stays a UI concern
+        self.tabs_registry: TabRegistry = tab_registry
 
         self.group_controller: AnalysisGroupController = group_controller
 
@@ -1190,8 +1310,8 @@ class GuiController(BusSubscriberMixin):
         self.window: QMainWindow | None = None
 
         # Hydration state flags
-        self._needs_full_refresh = False
-        self._tabs_initialized = False
+        self._needs_full_refresh: bool = False
+        self._tabs_initialized: bool = False
 
         self.subscribe(CfgChanged, self._on_cfg_changed)
         self.subscribe(UiRequestRefreshTabs, self._on_refresh_tabs)
@@ -1235,6 +1355,8 @@ class GuiController(BusSubscriberMixin):
             self._refresh_tabs_from_model()
             self._needs_full_refresh = False
 
+        self._trigger_raw_data_preparation()
+
     def _build_main_window(self) -> QMainWindow:
         window = ClearMapApp(self.experiment_controller, self._bus, self)
         window.fix_styles()
@@ -1258,6 +1380,10 @@ class GuiController(BusSubscriberMixin):
 
     def _tab_instances_by_class(self) -> Dict[Type[Any], Any]:
         return {t.__class__: t for t in self._tabs}
+
+    def _active_pipeline_names(self) -> set[str]:
+        """Pipeline names currently served by active tabs."""
+        return {getattr(t, 'pipeline_name', None) for t in self._tabs if getattr(t, 'pipeline_name', None)}
 
     def _get_or_create(self, cls: Type[GenericTab], tab_idx: int = -1) -> GenericTab:
         by_cls = self._tab_instances_by_class()
@@ -1295,6 +1421,11 @@ class GuiController(BusSubscriberMixin):
         Decide which tabs exist (via TabRegistry + validators/materializers),
         create or reuse instances, inject callbacks, and notify UI.
         """
+        if self._needs_tab_reset:
+            self._tabs = []  # empties the lookup before _build_tabs_from_registry
+            self._tabs_initialized = False
+            self._needs_tab_reset = False
+
         self._tabs = self._build_tabs_from_registry()
         self.publish(TabsUpdated(titles=[t.name for t in self._tabs], tabs=self._tabs))
 
@@ -1321,7 +1452,7 @@ class GuiController(BusSubscriberMixin):
     def _get_config_view(self) -> Any:
         return self.experiment_controller.get_config_view
 
-    # ---------- handlers ----------
+    # ---------- change classification ----------
 
     def _tabs_may_have_changed(self, changed_keys: Tuple[str, ...]) -> bool:
         """
@@ -1334,53 +1465,100 @@ class GuiController(BusSubscriberMixin):
 
         Parameters
         ----------
-        changed_keys: Tuple[str, ...]
-            The keys that changed in the config
+        changed_keys : Tuple[str, ...]
+            The keys that changed in the config.
 
         Returns
         -------
         bool
-            True if tabs may have changed, False otherwise
+            True if tabs may need to be rebuilt.
         """
-        irrelevant_d_types = {'undefined', 'no-pipeline', None}
+        if whole_sample_changed(changed_keys):
+            return True
 
-        for k in changed_keys:
-            if k == 'sample':  # Whole sample changed
+        channels = self.experiment_controller.get_config_view().get(
+            'sample', {}).get('channels', {})
+
+        if channels_added_or_removed(changed_keys):
+            # check if any ch has pipeline relevant data
+            data_types = {ch.get('data_type') for ch in channels.values()}
+            if data_types - IRRELEVANT_DATA_TYPES:
                 return True
-            elif k.startswith('sample.channels.'):
-                channels = self.experiment_controller.get_config_view().get(
-                    'sample', {}).get('channels', {})
-                if k.count('.') == 2:  # channels list changed
-                    # check if any ch has pipeline relevant data
-                    data_types = {ch.get('data_type') for ch in channels.values()}
-                    if data_types - irrelevant_d_types:
-                        return True
-                    # Post-change has no relevant types — but maybe pre-change did
-                    # (channel with relevant type was just removed).
-                    # Check if any existing tab serves a pipeline that no longer
-                    # has channels:
-                    for tab in self._tabs:
-                        if hasattr(tab, '_get_channels') and tab._get_channels():
-                            continue  # tab still has work to do
-                        if getattr(tab, 'pipeline_name', None):
-                            return True  # orphaned pipeline tab → needs rebuild
-                elif k.endswith('.data_type'):  # data type of a channel changed
-                    # Check if it changed from invalid to valid or vice versa (exclude from missing to invalid)
-                    channel_name = k.split('.')[2]
-                    new_type = channels.get(channel_name, {}).get('data_type')
-                    if new_type not in irrelevant_d_types:
-                        return True  # became relevant
-                    # New type is irrelevant — but was old type relevant?
-                    # We don't have the old value, so check if ANY channel
-                    # still has a relevant type. If not, tabs may need pruning.
-                    all_types = {ch.get('data_type') for ch in channels.values()}
-                    if not (all_types - irrelevant_d_types):
-                        # No relevant channels left — if we currently have
-                        # pipeline tabs, they need to go
-                        if any(getattr(t, 'pipeline_name', None) for t in self._tabs):
-                            return True
-        else:
+            if self._has_orphaned_pipeline_tabs():
+                return True
+
+        if channel_data_type_changed(changed_keys):
+            if self._data_type_change_affects_tabs(changed_keys, channels):
+                return True
+
+        return False
+
+    def _has_orphaned_pipeline_tabs(self) -> bool:
+        """Check if any pipeline tab no longer has channels to serve."""
+        for tab in self._tabs:
+            if hasattr(tab, '_get_channels') and tab._get_channels():
+                continue  # tab still has work to do
+            if getattr(tab, 'pipeline_name', None):
+                return True  # orphaned pipeline tab → needs rebuild
+        return False
+
+    def _data_type_change_affects_tabs(self, changed_keys: Tuple[str, ...],
+                                        channels: dict) -> bool:
+        """Check if a data_type change requires tab rebuild."""
+        changed_channels = channels_with_changed_property(changed_keys, '.data_type')
+        if not changed_channels:
             return False
+
+        for channel_name in changed_channels:
+            new_type = channels.get(channel_name, {}).get('data_type')
+            if new_type not in IRRELEVANT_DATA_TYPES:
+                return True  # became relevant
+
+        # Type became irrelevant — check if any relevant types remain
+        all_types = {ch.get('data_type') for ch in channels.values()}
+        if not (all_types - IRRELEVANT_DATA_TYPES):  # prune pipeline tabs if no relevant channels left
+            if self._active_pipeline_names():
+                return True
+
+        return False
+
+    # ---------- raw data preparation ----------
+
+    def _trigger_raw_data_preparation(self):
+        """Prompt assembly of non-tiled channels when needed."""
+        sample_tab = self._find_tab_by_key('sample_info')
+        if sample_tab:
+            sample_tab.prompt_prepare_all_channels_raw_data()
+
+    def _reset_preparation_guard(self):
+        """Reset the once-per-session guard so the prompt fires for newly configured channels."""
+        sample_tab = self._find_tab_by_key('sample_info')
+        if sample_tab:
+            sample_tab._preparation_offered = False
+
+    # ---------- event handlers ----------
+
+    def _on_cfg_changed(self, evt: CfgChanged):
+        self.sample_manager = self.experiment_controller.sample_manager  # to be sure
+        if self.hydrating:  # Hydration: Cache and defer full refresh until hydration ends
+            if self._tabs_may_have_changed(evt.changed_keys):
+                self._needs_full_refresh = True
+        else:  # Normal operation
+            # Ensure workspace/runtime state is reconciled before tab rebuilds
+            # that may instantiate workers reading from workspace.
+            if self.sample_manager is not None:
+                self.sample_manager.update_workspace()
+
+            if self._tabs_may_have_changed(evt.changed_keys):  # Infer if channels/types changed
+                self._install_or_update_tabs()
+                self._tabs_initialized = True
+
+            self._refresh_tabs_from_model()
+
+            # Channel path changed → may need raw data preparation
+            if channel_path_changed(evt.changed_keys):
+                self._reset_preparation_guard()
+                self._trigger_raw_data_preparation()
 
     def _on_tab_activated(self, evt: UiTabActivated) -> None:
         ok, msg = self._handle_tab_activation(evt.key)
@@ -1426,8 +1604,7 @@ class GuiController(BusSubscriberMixin):
         Parameters
         ----------
         key: str
-            The key of the tab to find (e.g. 'sample', 'registration', etc)
-            The key is expected to be in snake_case and is derived from the tab title (e.g. 'Sample info' → 'sample_info')
+            Snake_case key derived from the tab title (e.g. 'sample_info').
 
         Returns
         -------
@@ -1438,17 +1615,6 @@ class GuiController(BusSubscriberMixin):
             if title_to_snake(tab.name) == key:
                 return tab
         return None
-
-    def _on_cfg_changed(self, evt: CfgChanged):
-        self.sample_manager = self.experiment_controller.sample_manager  # to be sure
-        if self.hydrating:  # Hydration: Cache and defer full refresh until hydration ends
-            if self._tabs_may_have_changed(evt.changed_keys):
-                self._needs_full_refresh = True
-        else:  # Normal operation
-            if self._tabs_may_have_changed(evt.changed_keys):  # Infer if channels/types changed
-                self._install_or_update_tabs()
-                self._tabs_initialized = True
-            self._refresh_tabs_from_model()
 
     def _on_refresh_tabs(self, evt: UiRequestRefreshTabs):
         self._install_or_update_tabs()
@@ -1511,6 +1677,11 @@ def main(app_, splash_):
     gui.start(app_, centered=True)
 
     splash_.finish(gui.window)
+
+    install_global_handler(app_, parent_getter=lambda: gui.window,
+                           on_reset=lambda: gui.window.trigger_workspace_reset() if gui.window else None,
+                           on_close=lambda: app_.quit())
+
     if gui.window.preference_editor.params.verbosity != 'trace':  # WARNING: will disable progress bars
         gui.window.error_logger.setup_except_hook()
     sys.exit(app_.exec())

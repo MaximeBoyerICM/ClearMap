@@ -14,7 +14,7 @@ from typing import Any, Optional, Iterable, Dict, Sequence, List, Set, Tuple
 
 from ClearMap.Utils.utilities import deep_merge, REPLACE, DELETE, _REPLACE
 
-from ClearMap.config.compound_keys import PairKey
+from ClearMap.config.compound_keys import CompoundKey
 
 from ClearMap.config.config_handler import ALTERNATIVES_REG
 from ClearMap.config.config_adjusters.type_hints import (ConfigView, ConfigPatch, SampleManagerProtocol, KeysPath,
@@ -179,7 +179,7 @@ def apply_channel_renames(view: ConfigView, ctx: AdjustmentContext) -> ConfigPat
             continue
 
         if spec.compound and spec.rename.migrate_payload:
-            updated, changed = PairKey.rename_container_keys(current, rename_map, oriented=spec.compound_oriented)
+            updated, changed = CompoundKey.rename_container_keys(current, rename_map, oriented=spec.compound_oriented)
         else:
             changed = False
             updated = deepcopy(current)
@@ -428,10 +428,10 @@ def _compound_preprocess(*, spec: InstanceContainerSpec, cur_map: dict[str, Any]
     if not spec.compound:
         return cur_map, False
 
-    cur_map, moved = PairKey.normalize_container_keys(cur_map, oriented=spec.compound_oriented)
+    cur_map, moved = CompoundKey.normalize_container_keys(cur_map, oriented=spec.compound_oriented)
 
     if spec.compound_prune_invalid_atoms:
-        pruned = PairKey.prune_container_invalid_atoms(cur_map, allowed_atoms=set(sm.channels), oriented=spec.compound_oriented)
+        pruned = CompoundKey.prune_container_invalid_atoms(cur_map, allowed_atoms=set(sm.channels), oriented=spec.compound_oriented)
         moved = moved or (pruned != cur_map)
         cur_map = pruned
 
@@ -475,6 +475,10 @@ def _reconcile_replace_container(*, spec: InstanceContainerSpec, view: ConfigVie
       - optionally migrates payload for compound rename
       - optionally restricts to template schema
       - emits REPLACE(container)
+
+    ..note::
+        An existing entry that is an empty dict is treated as absent (falls through to full materialization) —
+         an empty dict signals "channel known but not yet configured", which is the same as a new channel.
     """
     changed = moved
 
@@ -486,22 +490,29 @@ def _reconcile_replace_container(*, spec: InstanceContainerSpec, view: ConfigVie
 
     new_map = {}
     for k in keys:
-        if spec.reconcile.policy.preserve_existing and isinstance(cur_map.get(k), dict):
-            new_map[k] = cur_map[k]
-            continue
-
-        carried_cfg = None
-        carried = False
-        if spec.compound and spec.rename.migrate_payload:
-            carried_cfg, carried = PairKey.migrate_container_payload(
-                container=cur_map, new_key=k, rename_map=sm.renamed_channels, oriented=spec.compound_oriented)
-
         base = _bound_template_for_key(spec=spec, key=k, view=view, sm=sm, resolver=resolver)
 
-        entry = deep_merge(deepcopy(base), deepcopy(carried_cfg)) if carried else deepcopy(base)
+        existing = cur_map.get(k)
+        if existing and spec.reconcile.policy.preserve_existing: # Fill missing entries from defaults if entry exists
+            # Fill gaps only — semantically identical to _reconcile_missing_only per-entry
+            # but inside REPLACE_CONTAINER so membership (add/remove) still applies.
+            entry = deepcopy(existing)
+            deep_merge_missing(entry, base)  # ← same call as _reconcile_missing_only
+            entry = normalize_json_compat(entry)
+            if entry != existing:
+                changed = True
+        else: # New or empty entry — full template materialization, with optional compound payload migration
+            carried_cfg = None
+            carried = False
+            if spec.compound and spec.rename.migrate_payload:
+                carried_cfg, carried = CompoundKey.migrate_container_payload(
+                    container=cur_map, new_key=k, rename_map=sm.renamed_channels, oriented=spec.compound_oriented)
 
-        needs_materialize = (not spec.reconcile.policy.preserve_existing) or (k not in cur_map) or (not cur_map.get(k))
-        changed = changed or (carried or needs_materialize)
+            entry = deep_merge(deepcopy(base), deepcopy(carried_cfg)) if carried else deepcopy(base)
+
+            # needs_materialize = (not spec.reconcile.policy.preserve_existing) or (k not in cur_map) or (not existing)
+            # changed = changed or (carried or needs_materialize)
+            changed = True  # new entry always counts as changed
 
         if spec.reconcile.restrict_to_template_keys and isinstance(entry, dict) and isinstance(base, dict):
             entry = _restrict_entry_to_template_keys(entry, base)

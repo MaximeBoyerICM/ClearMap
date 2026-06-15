@@ -3,23 +3,27 @@ import re
 import warnings
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 
-from ClearMap.Alignment.Stitching import StitchingRigid as stitching_rigid, StitchingWobbly as stitching_wobbly
-from ClearMap.Alignment.Stitching.StitchingWobbly import WobblyLayout
+from ClearMap.Alignment.Stitching import stitching_wobbly as stitching_wobbly
+from ClearMap.Alignment.Stitching import stitching_rigid as stitching_rigid
+
 from ClearMap.IO import IO as clearmap_io
 from ClearMap.IO.metadata import define_auto_stitching_params, parse_ome_info
+
 from ClearMap.Utils.exceptions import MissingRequirementException
 from ClearMap.Utils.tag_expression import Expression
 from ClearMap.Utils.utilities import check_stopped, sanitize_n_processes
-from ClearMap.Visualization.Color.Color import gray_image_to_rgb
-from ClearMap.Visualization.Qt import Plot3d as plot_3d
+
 from ClearMap.config.config_coordinator import ConfigCoordinator
-from ClearMap.gui.widgets import ProgressWatcher
+
 from ClearMap.pipeline_orchestrators.generic_orchestrators import PipelineOrchestrator
 from ClearMap.pipeline_orchestrators.sample_info_management import SampleManager
+
+if TYPE_CHECKING:
+    from ClearMap.gui.widgets import ProgressWatcher
 
 
 class StitchingProcessor(PipelineOrchestrator):
@@ -32,7 +36,7 @@ class StitchingProcessor(PipelineOrchestrator):
     def __init__(self, sample_manager: SampleManager, cfg_coordinator: ConfigCoordinator):
         super().__init__(cfg_coordinator)
         self.sample_manager: SampleManager = sample_manager
-        self.progress_watcher: Optional[ProgressWatcher] = None
+        self.progress_watcher: Optional["ProgressWatcher"] = None
         self.__wobbly_stitching_place_re = 'done constructing constraints for component'
         self.__wobbly_stitching_align_lyt_re = ('Alignment: Wobbly alignment',
                                                 re.compile(r"Alignment:\sWobbly alignment \(\d+, \d+\)->\(\d+, \d+\) "
@@ -43,11 +47,16 @@ class StitchingProcessor(PipelineOrchestrator):
                                            re.compile(r"Alignment: aligning \(\d+, \d+\) with \(\d+, \d+\), alignment"
                                                       r" pair \d+/\d+ done, shift = \(-?\d+, -?\d+, -?\d+\),"
                                                       r" quality = -\d+\.\d+e\+\d+!"))
+        self.setup(sample_manager)
 
     def setup(self, sample_manager: Optional[SampleManager] = None, convert_tiles: bool = False):
         self.sample_manager = sample_manager if sample_manager else self.sample_manager
         if not self.cfg_coordinator.get_config_view('stitching'):
-            raise ValueError('Stitching config not set in config coordinator')
+            # Config not yet loaded (e.g. processor created before boot_open).
+            # workspace stays None; setup_complete stays False.
+            warnings.warn('Stitching config not set in config coordinator; StitchingProcessor setup incomplete.',
+                          stacklevel=2)
+            return
         if self.sample_manager.setup_complete:
             self.workspace = self.sample_manager.workspace
             if convert_tiles:
@@ -183,8 +192,10 @@ class StitchingProcessor(PipelineOrchestrator):
         overlaps_px = self._pick_overlap_px(ome_info.get('stitching'))
 
         # Real WobblyLayout
-        lyt = WobblyLayout(sources=sources, tile_shape=(nx, ny), tile_positions=tile_positions,
-                           positions=positions, overlaps=overlaps_px, axis=2)  # Axis = which axis "wobbles"
+        lyt = stitching_wobbly.WobblyLayout(sources=sources, tile_shape=(nx, ny),
+                                            tile_positions=tile_positions,
+                                            positions=positions, overlaps=overlaps_px,
+                                            axis=2)  # Axis = which axis "wobbles"
         lyt.lower_to_origin()  # Just in case
 
         placed_asset_path = self.get_path('layout', channel=channel, asset_sub_type='placed')
@@ -211,6 +222,34 @@ class StitchingProcessor(PipelineOrchestrator):
             asset.expression = exp.string().replace(z_expression, '')  # overwrite expression
             self.sample_manager.set_channel_expression(channel, asset.expression)
 
+    def prepare_all_channels_raw_data(self, force: bool = False) -> list[str]:
+        """
+        Prepare all pipeline-ready channels that don't yet have their working asset.
+        Tiled channels → convert tiles to npy. Non-tiled → stack/copy to stitched volume.
+        Idempotent unless force=True.
+
+        Parameters
+        ----------
+        force : bool
+            If True, re-prepare even if the working asset already exists.
+
+        Returns
+        -------
+        list[str]
+            Channel names that were prepared.
+        """
+        prepared = []
+        for ch in self.sample_manager.pipeline_ready_channels:
+            if self.sample_manager.is_tiled(ch):
+                if force or not self.sample_manager.has_npy(ch):
+                    self.convert_tiles_channel(ch)
+                    prepared.append(ch)
+            else:
+                if force or not self.sample_manager.get('stitched', channel=ch).exists:  # WARNING: self.workspace might not yet exist
+                    self.copy_or_stack(ch)
+                    prepared.append(ch)
+        return prepared
+
     def copy_or_stack(self, channel):
         """
         Copy or stack or convert to npy the channel data in case there is no X/Y tiling
@@ -220,8 +259,11 @@ class StitchingProcessor(PipelineOrchestrator):
         channel : str
             The channel to copy or stack
         """
-        clearmap_io.convert(self.get_path('raw', channel=channel),
-                            self.get_path('stitched', channel=channel))
+        try:
+            clearmap_io.convert(self.get_path('raw', channel=channel),
+                                self.get_path('stitched', channel=channel))
+        except FileNotFoundError as err:
+            warnings.warn(f'Could not copy / stack {channel=}, files not found; {err}')
 
     def stitch(self):
         if self.stopped:
@@ -459,6 +501,7 @@ class StitchingProcessor(PipelineOrchestrator):
             return
 
     def plot_stitching_results(self, channels=None, mode='side-by-side', parent=None):
+        from ClearMap.Visualization.Qt import Plot3d as plot_3d
         if channels is None:
             channels = self.sample_manager.stitchable_channels
         paths = []
@@ -500,6 +543,7 @@ class StitchingProcessor(PipelineOrchestrator):
         np.array(dtype=uint8)
             The overlay image
         """
+        from ClearMap.Visualization.Color.Color import gray_image_to_rgb
         asset = self.get('raw', channel=channel, sample_id=self.sample_manager.prefix)
         positions = asset.positions
         tile_shape = {k: v for k, v in zip('XYZ', asset.tile_shape)}  # TODO: use asset.tile_grid_shape
@@ -556,6 +600,7 @@ class StitchingProcessor(PipelineOrchestrator):
         image : array
           A color image.
         """
+        from ClearMap.Visualization.Color.Color import gray_image_to_rgb
         dest_shape = tuple(layout.extent[:-1])
         full_lower = layout.lower
         middle_z = round(layout.sources[0].shape[-1] / 2)

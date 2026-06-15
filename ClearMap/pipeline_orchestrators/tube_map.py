@@ -17,26 +17,29 @@ import platform
 import warnings
 import gc
 from concurrent.futures import ProcessPoolExecutor
-from typing import Optional, Dict, Sequence, Any
+from enum import Enum
+from pathlib import Path
+from typing import Optional, Dict, Any, Union, Callable
 
 import numpy as np
 import pandas as pd
 
-from ClearMap.Analysis.graphs.graph_filters import GraphFilter
 from PyQt5.QtWidgets import QDialogButtonBox
 
-from ClearMap.IO.workspace2 import Workspace2
-from ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing import initialize_sink
-from ClearMap.Utils.exceptions import PlotGraphError, ClearMapVRamException, MissingRequirementException, \
-    MissingAssetError
-from ClearMap.Visualization.Qt.utils import link_dataviewers_cursors
-from ClearMap.config.config_coordinator import ConfigCoordinator
-from ClearMap.pipeline_orchestrators.generic_orchestrators import PipelineOrchestrator, ProcessorSteps
-
 import ClearMap.IO.IO as clearmap_io
+from ClearMap.IO.Source import Source
+from ClearMap.IO.workspace2 import Workspace2
+from ClearMap.IO.workspace_asset import Asset
+
+from ClearMap.config.config_coordinator import ConfigCoordinator
+
+from ClearMap.pipeline_orchestrators.generic_orchestrators import PipelineOrchestrator, ProcessorSteps
 
 import ClearMap.Alignment.Resampling as resampling_module
 import ClearMap.Alignment.Elastix as elastix
+
+from ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing import initialize_sink
+import ClearMap.ParallelProcessing.BlockProcessing as block_processing
 
 import ClearMap.ImageProcessing.Experts.Vasculature as vasculature
 import ClearMap.ImageProcessing.Experts.tube_map_pipeline as modular_vasculature
@@ -47,16 +50,21 @@ import ClearMap.ImageProcessing.Binary.Filling as binary_filling
 
 import ClearMap.Analysis.Measurements.MeasureExpression as measure_expression
 import ClearMap.Analysis.Measurements.radius_measurements as measure_radius
-from ClearMap.Analysis.graphs import graph_processing
 import ClearMap.Analysis.Measurements.Voxelization as voxelization
 
-import ClearMap.ParallelProcessing.BlockProcessing as block_processing
-
-from ClearMap.Visualization.Qt import Plot3d as q_p3d
-from ClearMap.Visualization.Vispy import plot_graph_3d  # WARNING: vispy dependency
+from ClearMap.Analysis.graphs import graph_processing
+from ClearMap.Analysis.graphs.graph_filters import GraphFilter
 
 from ClearMap.gui.dialog_helpers import warning_popup
 from ClearMap.Utils.utilities import is_in_range, get_free_v_ram, clear_cuda_cache, sanitize_n_processes
+from ClearMap.Utils.exceptions import (PlotGraphError, ClearMapVRamException,
+                                       MissingRequirementException, MissingAssetError, AssetNotFoundError,
+                                       ClearMapAssetError, ClearMapValueError)
+
+from .sample_info_management import SampleManager
+from .registration_orchestrator import RegistrationProcessor
+
+from ..Analysis.graphs.graph_processing import Percentile
 
 __author__ = ('Christoph Kirst <christoph.kirst.ck@gmail.com>,'
               ' Sophie Skriabine <sophie.skriabine@icm-institute.org>,'
@@ -66,43 +74,67 @@ __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
 
-from ClearMap.pipeline_orchestrators.sample_info_management import SampleManager
-from ClearMap.pipeline_orchestrators.registration_orchestrator import RegistrationProcessor, RegistrationStatus
+
+MAX_PLOT_VERTICES = 300_000  # Empirical max number of vertices that can safely be plotted
 
 USE_BINARY_POINTS_FILE = not platform.system().lower().startswith('darwin')
+_SourcePath = Union[Path, str]
 
 
 class VesselGraphProcessorSteps(ProcessorSteps):
-    def __init__(self, workspace, channel: str | Sequence[str] ='', sub_step=''):
-        super().__init__(workspace, channel=channel, sub_step=sub_step)
-        self.graph_raw = 'raw'
-        self.graph_cleaned = 'cleaned'
-        self.graph_reduced = 'reduced'
-        self.graph_annotated = 'annotated'
+    graph_raw       = 'raw'
+    graph_cleaned   = 'cleaned'
+    graph_reduced   = 'reduced'
+    graph_annotated = 'annotated'
 
-    @property
-    def steps(self):
-        return self.graph_raw, self.graph_cleaned, self.graph_reduced, self.graph_annotated  # TODO: add traced
+    _default_steps = (graph_raw, graph_cleaned, graph_reduced, graph_annotated)  # TODO: add traced
 
     def asset_from_step_name(self, step):
         return self.workspace.get('graph', channel=self.channel, asset_sub_type=step)
 
 
 class BinaryVesselProcessorSteps(ProcessorSteps):
-    def __init__(self, workspace, channel='', sub_step=''):
-        super().__init__(workspace, channel=channel, sub_step=sub_step)
-        self.stitched = 'stitched'
-        self.binary = 'binary'
-        # self.postprocessed = 'postprocessed'
-        self.smoothed = 'smoothed'
-        self.deep_filled = 'deep_filled'
-        self.filled = 'filled'
-        self.combined = 'combined'
-        self.final = 'final'
+    stitched    = 'stitched'
+    binary      = 'binary'
+    smoothed    = 'smoothed'
+    deep_filled = 'deep_filled'
+    filled      = 'filled'
+    combined    = 'combined'
+    final       = 'final'
 
-    @property
-    def steps(self):
-        return self.stitched, self.binary, self.smoothed, self.deep_filled, self.filled, self.combined, self.final
+    _default_steps = (stitched, binary, smoothed, deep_filled, filled, combined, final)
+
+    # Fixed anchors that cannot be reordered
+    _prefix_steps = (stitched, binary)
+    _suffix_steps = (combined, final)
+
+    _GUI_STEP_TO_ASSET: dict[str, str] = {
+        'binarize': 'binary',
+        'smooth': 'smoothed',
+        'binary_fill': 'filled',
+        'deep_fill': 'deep_filled',
+    }
+
+    _BINARIZE_STEP_MAP: dict[str, tuple[str, bool]] = {
+        'binarize':    ('binarize_channel',  False),
+        'smooth':      ('smooth_channel',    False),
+        'binary_fill': ('fill_channel',      True),   # prange — must be main thread
+        'deep_fill':   ('deep_fill_channel', False),
+    }
+
+    _lifecycle_steps: frozenset[str] = frozenset({stitched, combined, final})
+
+    def __init__(self, workspace, channel, config_provider: Callable[[], dict] | None = None):
+        self._config_provider = config_provider or (lambda: {})
+        super().__init__(workspace, channel)
+        self._outputs: Dict[str, _SourcePath] = {}
+        self._pending_cleanup: list[str] = []  # canonical paths to delete
+
+    @classmethod
+    def _default_middle_steps(cls) -> tuple[str, ...]:
+        """Steps between prefix and suffix, derived from _default_steps."""
+        anchors = set(cls._prefix_steps) | set(cls._suffix_steps)
+        return tuple(s for s in cls._default_steps if s not in anchors)
 
     def asset_from_step_name(self, step):  # FIXME: split step and substep
         if step in (self.stitched, self.binary):
@@ -111,27 +143,136 @@ class BinaryVesselProcessorSteps(ProcessorSteps):
             asset = self.workspace.get('binary', channel=self.channel, asset_sub_type=step)
         return asset
 
-    # def last_path(self, arteries=False):
-    #     return self.path(self.last_step, arteries=arteries)
-    #
-    # def previous_path(self, arteries=False):
-    #     if self.previous_step is not None:
-    #         return self.path(self.previous_step, arteries=arteries)
+    @property
+    def steps(self) -> tuple[str, ...]:
+        """
+        Compute step order fresh on each access — reflects any GUI
+        reordering committed to config since construction.
+        """
+        cfg_order = self._config_provider().get('step_order')
+
+        prefix = list(self._prefix_steps)
+        suffix = list(self._suffix_steps)
+        anchor_assets = set(self._prefix_steps) | set(self._suffix_steps)
+
+        if cfg_order:
+            middle = [self._GUI_STEP_TO_ASSET[name]
+                      for name in cfg_order
+                      if name in self._GUI_STEP_TO_ASSET
+                      and self._GUI_STEP_TO_ASSET[name] not in anchor_assets]
+        else:
+            middle = list(self._default_middle_steps())
+
+        return tuple(prefix + middle + suffix)
+
+
+    #   #################################  output tracking ####################################
+
+    @staticmethod
+    def _extract_backing_path(output: Any) -> _SourcePath:
+        """
+        Extract a plain path from whatever a step produces.
+        Asset → .path, Source → .location, Path/str → as-is.
+        Never stores a live Source or array — clearmap_io.as_source()
+        reconstructs on demand.
+        """
+        if isinstance(output, Asset):
+            return output.path
+        elif isinstance(output, Source):  # covers MMP.Source, npy.Source …
+            return output.location
+        elif isinstance(output, (Path, str)):
+            return output
+        else:
+            raise ClearMapValueError(f'Output can only be a path/str, Asset or Source. Got {type(output)}')
+        # return output  # unexpected — caller will fail loudly
+
+    def record_output(self, asset: str, output: Any,
+                      temp_path: str = '', keep: bool = False) -> None:
+        """
+        Store the backing path of a completed step.
+
+        Source objects are serialisable path handles — we extract .path so
+        _outputs holds only plain Paths, never live Source instances.
+        clearmap_io.as_source(path) reconstructs on demand.
+        """
+        output_path = self._extract_backing_path(output)
+        self._outputs[asset] = output_path
+        if output_path and not keep:
+            self._pending_cleanup.append(str(output_path))
+
+    def consume_and_cleanup(self) -> None:
+        """Delete the pending temp file once the next step has consumed its input."""
+        for to_clean in self._pending_cleanup:
+            try:
+                clearmap_io.delete_file(to_clean)
+            except Exception:
+                pass
+        self._pending_cleanup = []
+
+    def get_source(self, current_asset: str) -> _SourcePath:
+        """
+        Walk backward from current_asset through the configured (non-lifecycle)
+        step order and return the first available backing path.
+
+        Precedence per previous step:
+          1. In-memory result stored by record_output  (is-not-None guard)
+          2. On-disk asset
+          3. Raw binary (fallback)
+
+        Callers reconstruct the Source with clearmap_io.as_source(result).
+        """
+        order = [s for s in self.steps if s not in self._lifecycle_steps]
+
+        try:
+            current_idx = order.index(current_asset)
+        except ValueError:
+            return self.asset_from_step_name(self.binary).path
+
+        for prev_asset in reversed(order[:current_idx]):
+            stored = self._outputs.get(prev_asset)
+            if stored is not None:
+                return stored
+            try:
+                asset = self.get_asset(prev_asset)
+                if asset.exists:
+                    return asset.path
+            except (KeyError, AttributeError, FileNotFoundError,
+                    AssetNotFoundError, ClearMapAssetError):  # For skipped steps
+                continue
+
+        return self.asset_from_step_name(self.binary).path
+
+    def get_last_output(self) -> _SourcePath:
+        """
+        Return the last available output path, used by combine_binary.
+        """
+        order = [s for s in self.steps if s not in self._lifecycle_steps]
+
+        for step in reversed(order):
+            stored = self._outputs.get(step)
+            if stored is not None:
+                return stored
+            try:
+                asset = self.get_asset(step)
+                if asset.exists:
+                    return asset.path
+            except (IndexError, KeyError, AttributeError, FileNotFoundError):
+                continue
+
+        raise FileNotFoundError(f'No binary output found for channel "{self.channel}"')
 
 
 class BinaryVesselProcessor(PipelineOrchestrator):
     config_name = 'vasculature'
 
     def __init__(self, sample_manager: Optional[SampleManager] = None,
-                 config_coordonator: Optional[ConfigCoordinator] = None):
-        super().__init__(config_coordonator)
+                 config_coordinator: Optional[ConfigCoordinator] = None):
+        super().__init__(config_coordinator)
         self.sample_manager: Optional[SampleManager] = None
         self.workspace: Optional[Workspace2] = None
 
         self.inputs_match = False
-
-        # asset parameters for the postprocessing step that was run last
-        self.postprocessing_last_step = {}  # {'ch0': {'source': None, 'temp_path': '', 'keep': True}}
+        self.inputs_shapes: tuple = (None, None)
 
         self.all_vessels_channel: str = ''
         self.arteries_channel: str = ''
@@ -154,24 +295,30 @@ class BinaryVesselProcessor(PipelineOrchestrator):
                 warnings.warn('Vessels channel not set')
                 return
 
+            # noinspection PyTypeChecker
             self.arteries_channel = self.sample_manager.get_channels_by_type(channel_type='arteries',
                                                                              multiple_found_action='warn')
 
             self.assert_input_shapes_match()
 
             all_channels = self.sample_manager.channels
-            for k in self.steps.keys():
-                if k not in all_channels:
-                    self.steps.pop(k)
+            obsolete_channels = [k for k in self.steps if k not in all_channels]
+            for k in obsolete_channels:
+                del self.steps[k]
 
-            for channel_name in (self.all_vessels_channel, self.arteries_channel):  # TODO: add veins here too
+            for channel_name in self.channels_to_binarize():
                 if channel_name:
-                    self.steps[channel_name] = BinaryVesselProcessorSteps(self.workspace, channel=channel_name)
+                    self.steps[channel_name] = BinaryVesselProcessorSteps(
+                        self.workspace, channel=channel_name,
+                        config_provider=lambda ch=channel_name: (
+                            self.config.get('binarization', {}).get('single_channels', {}).get(ch, {})))
 
             compound_channel = tuple(self.channels_to_binarize())  # FIXME: old keys not cleared
             sample_id = self.sample_manager.prefix
             self.workspace.ensure_pipeline('TubeMap', compound_channel, sample_id=sample_id,
                                            channel_content_type='compound', create_channel=True)
+
+    # ############################### INPUTS ###############################
 
     def assert_input_shapes_match(self):
         """
@@ -197,13 +344,20 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         self.inputs_match = True  # WARNING: may need to be reset when changing channels to binarize
         self.inputs_shapes = shapes
 
+    def channels_to_binarize(self):
+        return self.sample_manager.get_channels_by_pipeline('TubeMap', as_list=True)
+
     def assets_to_binarize(self) -> list[Any]:
         channels_to_binarize = self.channels_to_binarize()
         assets_to_binarize = [self.workspace.get('stitched', channel=c) for c in channels_to_binarize]
         return assets_to_binarize
 
+    # ############################# PUBLIC API ######################################
+
     def run(self):
         self.binarize()
+        for channel in self.channels_to_binarize():
+            self.postprocess(channel)
         self.combine_binary()
 
     def binarize(self):
@@ -215,8 +369,25 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         else:
             raise ValueError('Channels to binarize have different shapes. This is not supported yet.')
 
-    def channels_to_binarize(self):
-        return self.sample_manager.get_channels_by_pipeline('TubeMap', as_list=True)
+    def postprocess(self, channel: str) -> None:
+        """
+        Run post-processing steps (smooth, fill, deep_fill) for *channel* in
+        the order declared by step_order in the config.
+
+        Binarize is always the first step and is excluded here — it runs via
+        binarize() / binarize_channel() before postprocess is called.
+        """
+        dispatch: Dict[str, Callable] = {
+            BinaryVesselProcessorSteps.smoothed: self.smooth_channel,
+            BinaryVesselProcessorSteps.filled: self.fill_channel,
+            BinaryVesselProcessorSteps.deep_filled: self.deep_fill_channel,
+        }
+        for step in self.steps[channel].steps:
+            if step in BinaryVesselProcessorSteps._lifecycle_steps or step == BinaryVesselProcessorSteps.binary:
+                continue
+            fn = dispatch.get(step)
+            if fn is not None:
+                fn(channel)
 
     def __get_n_blocks(self, channel):
         # TODO: use actual processing params to get real n blocks
@@ -226,21 +397,23 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         n_blocks = int(np.ceil((dim_size - blk_size) / (blk_size - overlap) + 1))
         return n_blocks
 
-
     @staticmethod
     def setup_channel_operation(operation):
         @functools.wraps(operation)
         def wrapper(self, channel, *args, **kwargs):
-            cfg = self.config['binarization']['single_channels']
             operation_type = operation.__name__.replace('_channel', '')
-            operations = list(cfg[channel].keys())
             if operation_type == 'deep_fill':
                 n_blocks = 1200
             else:
                 n_blocks = self.__get_n_blocks(channel)
 
-            # FIXME: find other way to increment
-            increment_main = not( channel == self.channels_to_binarize()[0] and operation_type == operations[0])
+            asset_to_gui = {v: k for k, v in BinaryVesselProcessorSteps._GUI_STEP_TO_ASSET.items()}
+            gui_order = [asset_to_gui[stp] for stp in self.steps[channel].steps
+                         if stp not in BinaryVesselProcessorSteps._lifecycle_steps]
+                         # and stp in asset_to_gui]  # TODO: check guard against unknown steps
+            first_op = gui_order[0] if gui_order else operation_type
+            first_step = channel == self.channels_to_binarize()[0] and operation_type == first_op
+            increment_main = not first_step
             self.prepare_watcher_for_substep(n_blocks, self.block_re,
                                              f'{operation_type} {channel.title()}', increment_main)
 
@@ -262,7 +435,7 @@ class BinaryVesselProcessor(PipelineOrchestrator):
 
     @setup_channel_operation
     def deep_fill_channel(self, channel):  # n_blocks because of decorator
-        self.__deep_fill_channel(channel)  # TODO: update watcher
+        self._deep_fill_channel(channel)  # TODO: update watcher
 
     def _binarize(self, channel):
         """
@@ -310,24 +483,20 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         modular_vasculature.binarize_modular(source, sink,
                                              binarization_parameter=binarization_parameter,
                                              processing_parameter=processing_parameter)
+        keep = binarization_cfg['binarize'].get('save', True)
+        self.steps[channel].record_output(BinaryVesselProcessorSteps.binary, sink, keep=keep)
 
     def plot_binarization_result(self, parent=None, channel='', arrange=False):
         """
         channel str:
             The channel to plot
         """
+        from ClearMap.Visualization.Qt import Plot3d as q_p3d
         images = [(self.get_path('stitched', asset_sub_type=channel)),
                   (self.get_path('binary', asset_sub_type=channel))]
         dvs = q_p3d.plot(images, title=[img.name for img in images],
                          arrange=arrange, lut=self.machine_config['default_lut'], parent=parent)
         return dvs
-
-    def __get_post_processing_source(self, channel, step):
-        if channel not in self.postprocessing_last_step:
-            self.postprocessing_last_step[channel] = {'source': None, 'temp_path': '', 'keep': True}
-        src = self.postprocessing_last_step[channel]['source']
-        previous_step_path = (self.steps[channel].get_asset(step, step_back=True, n_before=1)).path
-        return src or previous_step_path  #  self.get_path('binary', channel=channel)
 
     def _smooth(self, channel):
         binarization_cfg = self.config['binarization']['single_channels'][channel]
@@ -336,53 +505,50 @@ class BinaryVesselProcessor(PipelineOrchestrator):
 
         self.steps[channel].remove_next_steps_files(self.steps[channel].smoothed)
 
-        source = self.__get_post_processing_source(channel, 'smoothed')
+        source = self.steps[channel].get_source(BinaryVesselProcessorSteps.smoothed)
         source = clearmap_io.as_source(source)
-        sink = self.get_path('binary', channel=channel, asset_sub_type='smoothed')
-        sink = initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
-
-        if binarization_cfg['smooth']['run']:  # FIXME: path excluded above
-            smoothing_parameters = copy.deepcopy(vasculature.default_postprocessing_parameter['smooth'])
-        else:
-            smoothing_parameters = {}
+        sink_path = self.get_path('binary', channel=channel, asset_sub_type='smoothed')
+        smoothing_parameters = copy.deepcopy(vasculature.default_postprocessing_parameter['smooth'])
 
         channel_perf = self.config['performance']['binarization']['single_channels'][channel]
         perf_cfg = channel_perf['smooth']['block_processing']
         perf_params = copy.deepcopy(vasculature.default_postprocessing_processing_parameter)
         perf_params.update(size_max=perf_cfg['size_max'])
-        smoothed, tmp_f_path = vasculature.apply_smoothing(source, sink, smoothing_parameters, perf_params,
-                                                           processes=sanitize_n_processes(perf_cfg['n_processes']),
-                                                           verbose=True)
 
-        self.postprocessing_last_step[channel] = {'source': smoothed, 'temp_path': tmp_f_path,
-                                                  'keep': smoothing_parameters.get('save', False)}
+        result = vasculature.apply_smoothing(source, sink_path, smoothing_parameters, perf_params,
+                                             processes=sanitize_n_processes(perf_cfg['n_processes']),
+                                             verbose=True)
+
+        self.steps[channel].consume_and_cleanup()
+        keep = binarization_cfg['smooth'].get('save', True)
+        self.steps[channel].record_output(BinaryVesselProcessorSteps.smoothed, result[1], keep=keep)
 
     def _fill(self, channel):
         if not self.config['binarization']['single_channels'][channel]['binary_fill']['run']:
             return
-        source = self.__get_post_processing_source(channel, 'filled')
-        sink = self.get_path('binary', channel=channel, asset_sub_type='filled')
 
         self.steps[channel].remove_next_steps_files(self.steps[channel].filled)
 
+        source = self.steps[channel].get_source(BinaryVesselProcessorSteps.filled)
         source = clearmap_io.as_source(source)
+        sink = self.get_path('binary', channel=channel, asset_sub_type='filled')
         sink = initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
 
         perf_cfg = self.config['performance']['binarization']['single_channels'][channel]['binary_fill']
         binary_filling.fill(source, sink=sink, processes=sanitize_n_processes(perf_cfg['n_processes']),
-                            verbose=True)  # WARNING: prange if filling
-        if self.postprocessing_last_step[channel]['temp_path'] and not self.postprocessing_last_step[channel]['keep']:
-            clearmap_io.delete_file(self.postprocessing_last_step[channel]['temp_path'])
+                            verbose=True)
 
-        self.postprocessing_last_step[channel] = {'source': sink, 'temp_path': '', 'keep': False}
+        self.steps[channel].consume_and_cleanup()
+        keep = self.config['binarization']['single_channels'][channel]['binary_fill'].get('save', True)
+        self.steps[channel].record_output(BinaryVesselProcessorSteps.filled, sink, keep=keep)
 
-    def __deep_fill_channel(self, channel, size_max=None, overlap=None, resample_factor=None):
+    def _deep_fill_channel(self, channel, size_max=None, overlap=None, resample_factor=None):
         binary_cfg = self.config['binarization']['single_channels'][channel]
         if not binary_cfg['deep_fill']['run']:
             return
 
         perf_params = self.config['performance']['binarization']['single_channels'][channel]['deep_fill']['block_processing']
-        REQUIRED_V_RAM = 22000  # FIXME: put in config or at top of module
+        REQUIRED_V_RAM = 22000  # REFACTOR: put in config or at top of module
         if size_max is None:
             size_max = perf_params['size_max']
         if overlap is None:
@@ -393,17 +559,17 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         if not get_free_v_ram() > REQUIRED_V_RAM:
             btn = warning_popup(f'Insufficient VRAM',
                                 f'You do not have enough free memory on your graphics card to '
-                                f'run this operation. This step needs 22GB VRAM, {get_free_v_ram()/1000} were found. '
+                                f'run this operation. This step needs 22GB VRAM, {get_free_v_ram() / 1000} were found. '
                                 f'Please free some or upgrade your hardware.')
             if btn == QDialogButtonBox.Abort:
                 raise ClearMapVRamException(f'Insufficient VRAM, found only {get_free_v_ram()} < {REQUIRED_V_RAM}')
             elif btn == QDialogButtonBox.Retry:
-                self.__deep_fill_channel(channel, size_max, overlap, resample_factor)
+                self._deep_fill_channel(channel, size_max, overlap, resample_factor)
 
         self.steps[channel].remove_next_steps_files(self.steps[channel].deep_filled)
 
         # TODO: check how source casts to bool
-        source = self.__get_post_processing_source(channel, 'deep_filled')
+        source = self.steps[channel].get_source(BinaryVesselProcessorSteps.deep_filled)
         sink = self.get_path('binary', channel=channel, asset_sub_type='deep_filled')
 
         processing_parameter = copy.deepcopy(vessel_filling.default_fill_vessels_processing_parameter)
@@ -411,35 +577,24 @@ class BinaryVesselProcessor(PipelineOrchestrator):
 
         vessel_filling.fill_vessels(source, sink, resample=resample_factor, threshold=0.5,
                                     cuda=True, processing_parameter=processing_parameter, verbose=True)
-        gc.collect()
-        clear_cuda_cache()
+        gc.collect(); clear_cuda_cache()
 
-        self.postprocessing_last_step[channel] = {'source': sink, 'temp_path': '', 'keep': False}
+        self.steps[channel].consume_and_cleanup()
+        keep = binary_cfg['deep_fill'].get('save', True)
+        self.steps[channel].record_output(BinaryVesselProcessorSteps.deep_filled, sink, keep=keep)
 
     def combine_binary(self):
         """Merge the binary images of the different vascular network components into a single mask"""
         # FIXME: probably missing the call to workspace.add_channel(self.channels_to_binarize())
         sink_asset = self.get('binary', channel=self.channels_to_binarize(), asset_sub_type='combined')  # Temporary
         if len(self.channels_to_binarize()) > 1:
-            sources = []
-            for channel in self.channels_to_binarize():
-                if channel not in self.postprocessing_last_step:
-                    self.postprocessing_last_step[channel] = {'source': None, 'temp_path': '', 'keep': True}
-                if self.postprocessing_last_step[channel]['source']:
-                    sources.append(self.postprocessing_last_step[channel]['source'])
-                else:
-                    asset = self.steps[channel].get_asset(self.steps[channel].filled, step_back=True)
-                    if asset.exists:
-                        sources.append(asset.path)
-                    else:
-                        raise FileNotFoundError(f'File {asset.path} not found')
+            sources = [self.steps[ch].get_last_output() for ch in self.channels_to_binarize()]
             perf_params = self.config['performance']['binarization']['combine']['block_processing']
             block_processing.process(np.logical_or, sources, sink_asset.path,
                                      size_max=perf_params['size_max'], overlap=perf_params['overlap'],
                                      processes=sanitize_n_processes(perf_params['n_processes']), verbose=True)
         else:  # We expect to have at least all_vessels_channel
-            source = self.steps[self.all_vessels_channel].get_asset(self.steps[self.all_vessels_channel].filled,
-                                                                    step_back=True).path
+            source = self.steps[self.all_vessels_channel].get_last_output()
             clearmap_io.copy_file(source, sink_asset.path)
 
         self.post_process_binary_combined()
@@ -457,22 +612,25 @@ class BinaryVesselProcessor(PipelineOrchestrator):
             block_params['size_max'] = 50
             vasculature.postprocess(source, sink, postprocessing_parameter=postprocessing_parameter,
                                     processing_parameter=block_params,
-                                    processes=None, verbose=True)  # FIXME: n_processes in config?
+                                    processes=sanitize_n_processes(-1), verbose=True)  # TODO: n_processes in config?
         else:
-            clearmap_io.copy_file(source, sink)  # FIXME: could be a symlink
+            clearmap_io.link_file(source, sink)
 
     def plot_vessel_filling_results(self, parent=None, channel='', arrange=False):
+        from ClearMap.Visualization.Qt import Plot3d as q_p3d
         channel = channel if channel else self.all_vessels_channel
         images = [(self.steps[self.all_vessels_channel].get_asset(
-            self.steps[self.all_vessels_channel].postprocessed, step_back=True).path),
+            self.steps[self.all_vessels_channel].filled, step_back=True).path),  # FIXME: check if we really want filled here
                   (self.get_path('binary', channel=channel, asset_sub_type='filled'))]
         titles = [img.stem for img in images]
         images = [str(img) for img in images]
-        return q_p3d.plot(images, title=titles, arrange=arrange,
-                          lut=self.machine_config['default_lut'], parent=parent)
+        lut_ = self.machine_config['default_lut']
+        return q_p3d.plot(images, title=titles, arrange=arrange, lut=lut_, parent=parent)
 
     def plot_combined(self, parent=None, arrange=False):  # TODO: final or not option
-        all_vessels = self.steps[self.all_vessels_channel].get_asset(self.steps[self.all_vessels_channel].filled, step_back=True)
+        from ClearMap.Visualization.Qt import Plot3d as q_p3d
+        all_vessels = self.steps[self.all_vessels_channel].get_asset(self.steps[self.all_vessels_channel].filled,
+                                                                     step_back=True)
         combined = self.get_path('binary', channel=self.channels_to_binarize(), asset_sub_type='combined')
         if self.config['binarization']['single_channels'][self.arteries_channel]['binarize']['run']:
             arteries_filled = self.get_path('binary', channel=self.arteries_channel, asset_sub_type='filled')
@@ -484,6 +642,8 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         return dvs
 
     def plot_results(self, steps, channels=None, side_by_side=True, arrange=True, parent=None):
+        from ClearMap.Visualization.Qt.utils import link_dataviewers_cursors
+        from ClearMap.Visualization.Qt import Plot3d as q_p3d
         if channels is None:
             channels = [self.all_vessels_channel, ]
         images = [self.steps[channels[i]].get_asset(steps[i], step_back=True) for i in range(len(steps))]
@@ -513,6 +673,29 @@ class VesselGraphProcessor(PipelineOrchestrator):
     """
     config_name = 'vasculature'
 
+    # Legacy voxel-space thresholds — kept for old graphs without spacing/radius_units
+    # New graphs use µm equivalents from config
+    _LEGACY_THRESHOLDS = {
+        # artery channel expression measurement
+        'artery_search_shift_vx': 0.0,  # _set_artery_binary
+        'arteriness_search_shift_vx': 3.0,  # _set_arteriness
+        # vein channel expression measurement
+        'vein_search_shift_vx':      0.0,
+        'veinness_search_shift_vx':  3.0,
+        # post-process filters
+        'restrictive_vein_radius_vx': 6.5,
+        'permissive_vein_radius_vx': 6.5,
+        'final_vein_radius_vx': 6.5,
+        'artery_trace_radius_vx': 4.0,
+        'vein_trace_radius_vx': 5.0,
+    }
+
+    # Support for legacy graphs without physical units — determines how radii are measured and thresholds applied
+    class RadiusLevel(Enum):
+        FULL = 'full'  # spacing + radius_units + radius_units_axial  (current)
+        SCALAR_UM = 'scalar_um'  # spacing + radius_units, no axial             (intermediate)
+        VOXELS = 'voxels'  # only radii in voxels
+
     def __init__(self, sample_manager: Optional[SampleManager] = None,
                  config_coordinator: Optional[ConfigCoordinator] = None,
                  registration_processor: Optional[RegistrationProcessor] = None):
@@ -530,15 +713,11 @@ class VesselGraphProcessor(PipelineOrchestrator):
             'annotated': None,
             'traced': None
         }
-        self.sample_manager: Optional[SampleManager] = sample_manager
-        self.registration_processor: Optional[RegistrationProcessor] = registration_processor
         self.branch_density = None
         self.steps: VesselGraphProcessorSteps = VesselGraphProcessorSteps(self.workspace)  # FIXME: handle skeleton
         self.setup(sample_manager, registration_processor)
         self.parent_channels = tuple(self.config['binarization']['single_channels'].keys())
         self.steps.channel = self.parent_channels
-        self.arteries_channel = self.sample_manager.get_channels_by_type('arteries', missing_action='ignore',
-                                                                         multiple_found_action='error')
 
     def setup(self, sample_manager=None, registration_processor=None):
         self.sample_manager = sample_manager if sample_manager is not None else self.sample_manager
@@ -571,6 +750,24 @@ class VesselGraphProcessor(PipelineOrchestrator):
     def save_graph(self, base_name):
         graph = self.__graphs[base_name]  # We do not use the getter here to avoid loading the graph
         self.get('graph', channel=self.parent_channels, asset_sub_type=base_name).write(graph)
+
+    @staticmethod
+    def _graph_radius_level(graph) -> 'VesselGraphProcessor.RadiusLevel':
+        has_spacing = 'spacing' in graph.graph_properties
+        has_um = 'radius_units' in graph.vertex_properties
+        has_um_axial = 'radius_units_axial' in graph.vertex_properties
+        if has_spacing and has_um and has_um_axial:
+            return VesselGraphProcessor.RadiusLevel.FULL
+        if has_spacing and has_um:
+            return VesselGraphProcessor.RadiusLevel.SCALAR_UM
+        return VesselGraphProcessor.RadiusLevel.VOXELS
+
+    def _legacy_warn(self, method: str) -> None:
+        """Warn user if graphs are outdated and miss the units aware radii"""
+        warnings.warn(f"{method}: graph predates unit-aware radii ('radius_units_axial' / 'spacing' absent). "
+                      f"Falling back to voxel-space computation with legacy thresholds. "
+                      f"Rebuild the graph (re-run clean + reduce) for physical accuracy.",
+                      DeprecationWarning, stacklevel=3)
 
     @property
     def graph_raw(self):
@@ -615,7 +812,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
     def unload_temporary_graphs(self):
         """
         To free up memory
-        
+
         Returns
         -------
 
@@ -623,6 +820,16 @@ class VesselGraphProcessor(PipelineOrchestrator):
         self.graph_raw = None
         self.graph_cleaned = None
         self.graph_reduced = None
+
+    @property
+    def arteries_channel(self) -> str:
+        return self.sample_manager.get_channels_by_type('arteries', missing_action='ignore',
+                                                        multiple_found_action='error')
+
+    @property
+    def veins_channel(self) -> str:
+        return self.sample_manager.get_channels_by_type('veins', missing_action='ignore',
+                                                        multiple_found_action='error')
 
     @property
     def use_arteries_for_graph(self):  # TODO: see if improve
@@ -638,6 +845,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
         def wrapper(self, *args, **kwargs):
             graph_cfg = self.config['graph_construction']
             return operation(self, *args, graph_cfg=graph_cfg, **kwargs)
+
         return wrapper
 
     @staticmethod
@@ -650,7 +858,9 @@ class VesselGraphProcessor(PipelineOrchestrator):
                 except FileNotFoundError:
                     raise MissingRequirementException(f"Graph for step '{step}' is missing.")
                 return operation(self, *args, **kwargs)
+
             return wrapper
+
         return decorator
 
     @staticmethod
@@ -663,8 +873,29 @@ class VesselGraphProcessor(PipelineOrchestrator):
                 except FileNotFoundError:
                     raise MissingRequirementException(f"Binary asset '{asset_sub_type}' is missing.")
                 return operation(self, *args, **kwargs)
+
             return wrapper
+
         return decorator
+
+    # ################################ perf config accessor #####################################
+
+    @property
+    def _graph_perf_cfg(self) -> dict:
+        """
+        Read graph construction performance config (fresh each call)
+        """
+        return self.config.get('performance', {}).get('graph_construction', {})
+
+    def _n_processes(self, step: str) -> int | None:
+        """
+        Resolve n_processes for a graph construction step.
+        (Returns None when unset)
+        """
+        raw = self._graph_perf_cfg.get(step, {}).get('n_processes')
+        return sanitize_n_processes(raw) if raw is not None else None
+
+    ##################################### ACTUAL COMPUTATIONS ###################################
 
     def pre_process(self):
         self.skeletonize_and_build_graph()
@@ -673,10 +904,10 @@ class VesselGraphProcessor(PipelineOrchestrator):
         self.register()
 
     @reload_processing_config
-    def skeletonize_and_build_graph(self, graph_cfg=None):
-        self.skeletonize()  # WARNING: main thread (prange)
+    def skeletonize_and_build_graph(self, graph_cfg=None, binary_processor=None):
+        self.skeletonize(binary_processor)  # WARNING: main thread (prange)
         if graph_cfg['build']:
-            self._build_graph_from_skeleton()  # WARNING: main thread (prange)
+            self._build_graph_from_skeleton(binary_processor)  # WARNING: main thread (prange)
 
     @reload_processing_config
     def clean_graph(self, graph_cfg=None):
@@ -698,49 +929,147 @@ class VesselGraphProcessor(PipelineOrchestrator):
             self.__register()
 
     @requires_binary('final')
-    def skeletonize(self):
+    def skeletonize(self, binary_processor=None):
         if self.config['graph_construction']['skeletonize']:
             n_blocks = 100  # TODO: TBD
             self.prepare_watcher_for_substep(n_blocks, self.skel_re, f'Skeletonization', True)
-            binary = self.get_path('binary', channel=self.parent_channels, asset_sub_type='final')
+            if len(self.parent_channels) == 1:
+                binary = binary_processor.steps[self.parent_channels[0]].get_last_output()
+            else:
+                for sfx in ('final', 'combined'):
+                    binary_asset = self.get('binary', channel=self.parent_channels,
+                                            asset_sub_type=sfx)  # WARNING final changed to deep filled
+                    if binary_asset.exists:
+                        binary = binary_asset.path
+                        break
+
             skeletonization.skeletonize(binary, sink=self.get_path('skeleton', channel=self.parent_channels),  # WARNING: prange
-                                        delete_border=True, verbose=True)
+                                        delete_border=True, processes=self._n_processes('skeletonize'), verbose=True)
 
-    def _measure_radii(self):  # FIXME: do on the clean graph to avoid measuring cliques ?
+    def _measure_radii(self, binary_processor=None):  # FIXME: do on the clean graph to avoid measuring cliques ?
         coordinates = self.graph_raw.vertex_coordinates()
-        source = self.get_path('binary', channel=self.parent_channels, asset_sub_type='final')
-        spacing = np.array(self.sample_manager.get_channel_resolution(self.parent_channels[0]))
-        radii = measure_radius.measure_radius(source, coordinates,
-                                              value=0, fraction=None, max_radius=150,
-                                              return_indices=False, default=-1, scale=spacing)  # WARNING: prange
-        self.graph_raw.define_vertex_property('radius_units', radii)
-        # TODO: call measure_radius with return_radii_as_scalar=False and store vectors
 
-    def _set_graph_artery_property(self, asset_type, asset_sub_type=None, suffix='', radius_shift=0):
-        suffix = suffix or asset_type
+        if len(self.parent_channels) == 1:
+            source = binary_processor.steps[self.parent_channels[0]].get_last_output()
+        else:
+            for sfx in ('final', 'combined'):
+                binary_asset = self.get('binary', channel=self.parent_channels,
+                                        asset_sub_type=sfx)  # WARNING final changed to deep filled
+                if binary_asset.exists:
+                    source = binary_asset.path
+                    break
+        spacing = np.array(self.sample_manager.get_channel_resolution(self.parent_channels[0])) # µm/vox, shape (3,)
+
+        # Distances in all 3 directions
+        radii_um_axial = measure_radius.measure_radius(source, coordinates,
+                                                       value=0, fraction=None, max_radius=150,
+                                                       return_indices=False, default=-1,
+                                                       return_radii_as_scalar=False, scale=spacing)  # WARNING: prange
+
+        radii_vx_axial = radii_um_axial / spacing[None, :]  # (n, 3) voxels per axis
+
+        self.graph_raw.define_vertex_property('radius_units_axial', radii_um_axial)  # µm (n,3)
+        self.graph_raw.define_vertex_property('radii_axial', radii_vx_axial)  # vox (n,3)
+
+        # Euclidean norms
+        radii_um_scalar = np.linalg.norm(radii_um_axial, axis=1)
+        radii_vx_scalar = np.linalg.norm(radii_vx_axial, axis=1)
+
+        self.graph_raw.set_vertex_radii(radii_vx_scalar)  # FIXME: deprecate
+        self.graph_raw.define_vertex_property('radius_units', radii_um_scalar)
+
+        if not self.graph_raw.has_graph_property('spacing'):
+            self.graph_raw.add_graph_property('spacing', spacing)
+
+    def _set_vertex_vessel_type_expression(self, asset_type: str, channel: str, asset_sub_type=None,
+                                           radius_shift_um: float = 0.0,
+                                           _legacy_radius_shift_vx: float = 0.0):
+        """
+        Parameters
+        ----------
+        radius_shift_um : float
+            Extra search margin beyond the measured vessel wall, in µm.
+        """
+        dtype = self.sample_manager.data_type(channel)
+        dtype_singular = f'{dtype[:-3]}y' if dtype.endswith('ies') else dtype[:-1]
+        property_name = f'{dtype_singular}_{"raw" if asset_type == "stitched" else asset_type}'
+
         if not isinstance(asset_sub_type, (list, tuple)):
             asset_sub_type = [asset_sub_type]
         for sub_type in asset_sub_type:
-            source = self.get_path(asset_type, channel=self.arteries_channel, asset_sub_type=sub_type)
+            source = self.get_path(asset_type, channel=channel, asset_sub_type=sub_type)
             if source.exists():
                 break
-        coordinates = self.graph_raw.vertex_coordinates()  # OPTIMISE: cache ?
-        radii = self.graph_raw.vertex_radii() + radius_shift
-        search_radius = radii
-        # FIXME: search_radius in pixels so convert if physical units
-        expression = measure_expression.measure_expression(source, coordinates, search_radius, method='max')  # WARNING: prange
-        prop = expression if asset_type == 'binary' else np.asarray(expression.array, dtype=float)  # TODO: do as f(source.dtype)
-        self.graph_raw.define_vertex_property(f'artery_{suffix}', prop)
+
+        coordinates = self.graph_raw.vertex_coordinates()
+
+        level = self._graph_radius_level(self.graph_raw)
+        if level == VesselGraphProcessor.RadiusLevel.FULL:
+            spacing = np.array(self.graph_raw.graph_property('spacing'))   # µm/vox (3,)
+            # Per-axis physical radii + margin
+            radii_um_axial = self.graph_raw.vertex_property('radius_units_axial') + radius_shift_um  # Conservative: search far enough to cover vessel boundary in every axis
+            search_radius_vx = np.max(radii_um_axial / spacing, axis=1)
+        elif level == VesselGraphProcessor.RadiusLevel.SCALAR_UM:  # Intermediate level
+            self._legacy_warn(f'_set_vertex_channel_expression({property_name}) scalar µm fallback')
+            spacing          = np.array(self.graph_raw.graph_property('spacing'))
+            radii_um         = self.graph_raw.vertex_property('radius_units') + radius_shift_um
+            search_radius_vx = radii_um / np.mean(spacing)   # isotropic approx
+        else:  # full legacy level
+            self._legacy_warn(f'_set_vertex_channel_expression({property_name})')
+            search_radius_vx = self.graph_raw.vertex_radii_voxels() + _legacy_radius_shift_vx
+
+        search_radius_vx = np.floor(search_radius_vx).astype(np.int32)
+        res = measure_expression.measure_expression(source, coordinates, search_radius_vx, method='max',
+                                                    n_processes=self._n_processes('build'))  # WARNING: prange
+        prop = res if asset_type == 'binary' else np.asarray(res, dtype=float)  # TODO: do as f(source.dtype)
+        self.graph_raw.define_vertex_property(property_name, prop)
 
     def _set_artery_binary(self):
-        """Define if vertex is artery from binary labelling"""
-        self._set_graph_artery_property('binary', asset_sub_type=['filled', 'postprocessed'])
+        """Define if vertex is artery from binary labeling"""
+        # FIXME: should use last step of BinaryVesselProcessor
+        self._set_vertex_vessel_type_expression(asset_type='binary', channel=self.arteries_channel,
+                                                asset_sub_type=['filled', 'postprocessed'],
+                                                radius_shift_um=0.0,
+                                                _legacy_radius_shift_vx=self._LEGACY_THRESHOLDS[
+                                                    'artery_search_shift_vx'])
 
     def _set_arteriness(self):
-        """assign 'arteriness' from signal intensity"""
-        self._set_graph_artery_property('stitched', suffix='raw', radius_shift=10)
+        """Assign 'arteriness' from signal intensity."""
+        level = self._graph_radius_level(self.graph_raw)
+        if level != self.RadiusLevel.VOXELS:
+            spacing = np.array(self.graph_raw.graph_property('spacing'))
+            radius_shift_um = VesselGraphProcessor._LEGACY_THRESHOLDS['arteriness_search_shift_vx'] * np.mean(spacing)  # average enclosing
+        else:
+            # Legacy path — radius_shift_um is ignored inside
+            # _set_vertex_vessel_type_expression because it takes the
+            # voxel branch using _legacy_radius_shift_vx instead
+            radius_shift_um = 0.0
 
-    def _build_graph_from_skeleton(self):  # TODO: split for requirements
+        self._set_vertex_vessel_type_expression(asset_type='stitched', channel=self.arteries_channel,
+                                                radius_shift_um=radius_shift_um,
+                                                _legacy_radius_shift_vx=self._LEGACY_THRESHOLDS['arteriness_search_shift_vx'])
+
+    def _set_vein_binary(self):
+        """Define if vertex is vein from binary labeling"""
+        self._set_vertex_vessel_type_expression(asset_type='binary', channel=self.veins_channel,
+                                                asset_sub_type=['filled', 'postprocessed'],
+                                                radius_shift_um=0.0,
+                                                _legacy_radius_shift_vx=self._LEGACY_THRESHOLDS['vein_search_shift_vx'])
+
+    def _set_veinness(self):
+        """Assign 'veinness' from signal intensity."""
+        level = self._graph_radius_level(self.graph_raw)
+        if level != self.RadiusLevel.VOXELS:
+            spacing = np.array(self.graph_raw.graph_property('spacing'))
+            radius_shift_um = VesselGraphProcessor._LEGACY_THRESHOLDS['veinness_search_shift_vx'] * np.mean(spacing)
+        else:
+            radius_shift_um = 0.0
+
+        self._set_vertex_vessel_type_expression(asset_type='stitched', channel=self.veins_channel,
+                                                radius_shift_um=radius_shift_um,
+                                                _legacy_radius_shift_vx=self._LEGACY_THRESHOLDS['veinness_search_shift_vx'])
+
+    def _build_graph_from_skeleton(self, binary_processor=None):  # TODO: split for requirements
         if self.config['graph_construction']['build']:
             n_blocks = 100  # TBD:
             self.prepare_watcher_for_substep(n_blocks, self.build_graph_re, 'Building graph', True)
@@ -748,11 +1077,16 @@ class VesselGraphProcessor(PipelineOrchestrator):
             skeleton_path = self.get_path('skeleton', channel=self.parent_channels)
             spacing = self.sample_manager.get_channel_resolution(self.parent_channels[0])
             self.graph_raw = graph_processing.graph_from_skeleton(skeleton_path, spacing=spacing, physical_units='µm',
-                                                                  verbose=True)  # WARNING: main thread (prange)
-            self._measure_radii()  # WARNING: main thread (prange)
+                                                                  check_border=False,
+                                                                  n_processes=self._n_processes('build'), verbose=True)  # WARNING: main thread (prange)
+
+            self._measure_radii(binary_processor)  # WARNING: main thread (prange)
             if self.use_arteries_for_graph:  # TODO: do same for veins if exists
                 self._set_artery_binary()  # WARNING: main thread (prange)
                 self._set_arteriness()  # WARNING: main thread (prange)
+            if self.veins_channel:
+                self._set_vein_binary()
+                self._set_veinness()
             self.save_graph('raw')
 
     @requires_graph('raw')
@@ -766,12 +1100,13 @@ class VesselGraphProcessor(PipelineOrchestrator):
         """
         vertex_mappings = copy.copy(graph_processing.DEFAULT_VERTEX_TO_VERTEX)
         if self.use_arteries_for_graph:
-            vertex_mappings.update({
-                'artery_binary': np.max,
-                'artery_raw': np.max
-            })  # TODO: do same for veins if exists
+            vertex_mappings.update({'artery_binary': np.max, 'artery_raw': np.max})
+        if self.veins_channel:
+            vertex_mappings.update({'vein_binary': np.max, 'vein_raw': np.max})
         self.steps.remove_next_steps_files(self.steps.graph_cleaned)
-        self.graph_cleaned = graph_processing.clean_graph(self.graph_raw, vertex_mappings=vertex_mappings, verbose=True)
+        self.graph_cleaned = graph_processing.clean_graph(
+            self.graph_raw, vertex_mappings=vertex_mappings,
+            verbose=True)  # FIXME: add processes=self._n_processes('clean'),
         self.save_graph('cleaned')
 
     @requires_graph('cleaned')
@@ -782,25 +1117,33 @@ class VesselGraphProcessor(PipelineOrchestrator):
         -------
 
         """
-        def vote(expression):
-            return np.sum(expression) >= len(expression) / 1.5
+
+        binary_percentile = 100 / 3
+        vote = Percentile(binary_percentile)
 
         vertex_to_edge_mappings = vertex_to_edge_mappings or graph_processing.DEFAULT_VERTEX_TO_EDGE
         edge_to_edge_mappings = edge_to_edge_mappings
-        edge_geometry_vertex_properties = ['coordinates', 'coordinates_units', 'radii', 'radius_units', 
+        edge_geometry_vertex_properties = ['coordinates', 'coordinates_units', 'radii', 'radius_units',
                                            'length', 'chain_id', '_vertex_id_']
+        # add conditionally on new graphs
+        if 'radii_axial' in self.graph_cleaned.vertex_properties:
+            edge_geometry_vertex_properties.append('radii_axial')
+        if 'radius_units_axial' in self.graph_cleaned.vertex_properties:
+            edge_geometry_vertex_properties.append('radius_units_axial')
         if self.use_arteries_for_graph:
-            vertex_to_edge_mappings.update({
-                'artery_binary': vote,
-                'artery_raw': np.max})  # TODO: do same for veins if exists
+            vertex_to_edge_mappings.update({'artery_binary': vote, 'artery_raw': np.max})
             edge_geometry_vertex_properties.extend(['artery_binary', 'artery_raw'])
+        if self.veins_channel:
+            vertex_to_edge_mappings.update({'vein_binary': vote, 'vein_raw': np.max})
+            edge_geometry_vertex_properties.extend(['vein_binary', 'vein_raw'])
         self.steps.remove_next_steps_files(self.steps.graph_reduced)
         self.graph_reduced = graph_processing.reduce_graph(self.graph_cleaned,
                                                            vertex_to_edge_mappings=vertex_to_edge_mappings,
                                                            edge_to_edge_mappings=edge_to_edge_mappings,
                                                            compute_edge_length=True,
                                                            edge_geometry_vertex_properties=edge_geometry_vertex_properties,
-                                                           return_maps=False, verbose=True)
+                                                           return_maps=False,  # FIXME: add processes=self._n_processes('reduce'),
+                                                           verbose=True)
         self.save_graph('reduced')
 
     @property
@@ -823,7 +1166,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
                 for channel in self.get_registration_sequence_channels():
                     results_dir = self.get_path('aligned', channel=channel).parent
                     coordinates = elastix.transform_points(coordinates, transform_directory=results_dir,
-                                                      binary=USE_BINARY_POINTS_FILE, indices=False)
+                                                           binary=USE_BINARY_POINTS_FILE, indices=False)
             return coordinates
 
         self.graph_reduced.transform_properties(transformation=transformation,
@@ -833,23 +1176,89 @@ class VesselGraphProcessor(PipelineOrchestrator):
         self.save_graph('reduced')
 
     def _scale(self):
-        """Apply transform to graph properties"""
-        def scaling(radii):
-            resample_factor = resampling_module.resample_factor(
-                original_shape=self.binary_shape,
-                resampled_shape=self.resampled_shape)
-            return radii * np.mean(resample_factor)
+        """
+        Convert radius properties from original space to atlas-voxel space.
 
-        from_name = 'radius_units' if 'radius_units' in list(self.graph_reduced.vertex_properties) else 'radii'
-        to_name = f'{from_name}_atlas'
-        mapping = {from_name: to_name}
+        New graphs (FULL/SCALAR_UM): µm → atlas voxels
+            scalar:  r_atlas = r_um / mean(atlas_spacing)
+            axial:   r_atlas[:, i] = r_um[:, i] / atlas_spacing[i]
 
-        self.graph_reduced.transform_properties(transformation=scaling, vertex_properties=mapping,
-                                                edge_properties=mapping, edge_geometry_properties=mapping)
+        Legacy graphs (VOXELS): original voxels → atlas voxels
+            scalar:  r_atlas = r_vx * mean(spacing) / mean(atlas_spacing)
+            axial:   r_atlas[:, i] = r_vx[:, i] * resample_factor[i]
+        """
+        resample_factor = np.array(resampling_module.resample_factor(
+            original_shape=self.binary_shape,
+            resampled_shape=self.resampled_shape))                    # (3,)
+
+        graph = self.graph_reduced
+        level = self._graph_radius_level(graph)
+
+        if 'spacing' in graph.graph_properties:
+            spacing = np.array(graph.graph_property('spacing'))
+        else:
+            self._legacy_warn('_scale (no spacing)')
+            spacing = np.array(
+                self.sample_manager.get_channel_resolution(self.parent_channels[0]))
+
+        atlas_spacing      = spacing / resample_factor                # µm/atlas-vox (3,)
+        atlas_spacing_mean = float(np.mean(atlas_spacing))
+        spacing_mean       = float(np.mean(spacing))
+
+        # ── scan all radius-like properties ──────────────────────────────
+        radius_props: dict[str, tuple[bool, bool]] = {}   # name → (is_um, is_axial)
+        for prop_name in list(graph.vertex_properties):
+            if not ('radii' in prop_name or 'radius' in prop_name):
+                continue
+            if prop_name.endswith('_atlas'):
+                continue
+            prop   = graph.vertex_property(prop_name)
+            is_um    = any(prop_name.endswith(sfx) for sfx in ('_units', 'um'))
+            is_axial = prop.ndim == 2 and prop.shape[1] == 3
+            radius_props[prop_name] = (is_um, is_axial)
+
+        # ── define scaling functions ─────────────────────────────────────
+        def scale_um_scalar(r):
+            return r / atlas_spacing_mean
+
+        def scale_um_axial(r):
+            return r / atlas_spacing  # (n,3) / (3,)
+
+        def scale_vx_scalar(r):
+            return r * (spacing_mean / atlas_spacing_mean)
+
+        def scale_vx_axial(r):
+            return r * resample_factor  # (n,3) * (3,)
+
+        dispatch = {  # key tuple (is_um, us_axial)
+            (True,  True):  scale_um_axial,
+            (True,  False): scale_um_scalar,
+            (False, True):  scale_vx_axial,
+            (False, False): scale_vx_scalar,
+        }
+
+        # ── apply per group ──────────────────────────────────────────────
+        groups: dict[tuple[bool, bool], list[str]] = {}
+        for prop_name, key in radius_props.items():
+            groups.setdefault(key, []).append(prop_name)
+
+        for key, prop_names in groups.items():
+            fn      = dispatch[key]
+            mapping = {p: f'{p}_atlas' for p in prop_names}
+
+            e_mapping = {k: v for k, v in mapping.items()
+                         if k in graph.edge_properties}
+            eg_mapping = {k: v for k, v in mapping.items()
+                          if k in graph.edge_geometry_properties}
+
+            graph.transform_properties(transformation=fn, vertex_properties=mapping,
+                                         edge_properties=e_mapping or None,
+                                         edge_geometry_properties=eg_mapping or None)
 
     def _annotate(self):
         """Atlas annotation of the graph (i.e. add property 'region' to vertices)"""
-        annotator = self.registration_processor.annotators[self.parent_channels[0]]  # warning: assuming same annotator for all channels
+        annotator = self.registration_processor.annotators[
+            self.parent_channels[0]]  # warning: assuming same annotator for all channels
         self.graph_reduced.annotate_properties(functools.partial(annotator.label_points),
                                                vertex_properties={'coordinates_atlas': 'annotation'},
                                                edge_geometry_properties={'coordinates_atlas': 'annotation'})
@@ -860,8 +1269,8 @@ class VesselGraphProcessor(PipelineOrchestrator):
 
     def _compute_distance_to_surface(self):
         """add distance to brain surface as vertices properties"""
-        # %% Distance to surface
-        distance_atlas = self.get('atlas', channel=self.parent_channels[0], asset_sub_type='distance_to_surface').read()
+        distance_atlas = self.get('atlas', channel=self.parent_channels[0],
+                                  asset_sub_type='distance_to_surface').read()
         atlas_shape = distance_atlas.shape
 
         def distance(coordinates):
@@ -889,7 +1298,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
             self._compute_distance_to_surface()
         self.steps.remove_next_steps_files(self.steps.graph_annotated)
 
-        # discard non connected graph components
+        # discard non-connected graph components
         self.graph_annotated = self.graph_reduced.largest_component()
         self.save_graph('annotated')
 
@@ -910,7 +1319,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
                 - int/float: exact match
                 - str: string match (e.g. 'artery', 'vein')
                 - bool: 'True' or 'False' for boolean properties
-                - tuple: range (min, max) for numerical properties. None means open ended range.
+                - tuple: range (min, max) for numerical properties. None means open-ended range.
 
         Returns
         -------
@@ -922,7 +1331,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
 
     # POST PROCESS
     @requires_graph('annotated')
-    def _pre_filter_veins(self, vein_intensity_range_on_arteries_channel, min_vein_radius):
+    def _pre_filter_veins(self, vein_intensity_range_on_arteries_channel: tuple[float, float], min_vein_radius_um: float):
         """
         Filter veins based on radius and intensity in arteries channel
 
@@ -938,18 +1347,27 @@ class VesselGraphProcessor(PipelineOrchestrator):
         """
         is_in_vein_range = is_in_range(self.graph_annotated.edge_property('artery_raw'),
                                        vein_intensity_range_on_arteries_channel)
-        radii = self.graph_annotated.edge_property('radii')
-        restrictive_vein = np.logical_and(radii >= min_vein_radius, is_in_vein_range)
-        return restrictive_vein
+
+        level = self._graph_radius_level(self.graph_annotated)
+        if level != VesselGraphProcessor.RadiusLevel.VOXELS:
+            radii = self.graph_annotated.edge_radii_um()
+            threshold = min_vein_radius_um
+        else:
+            self._legacy_warn('_pre_filter_veins')
+            radii = self.graph_annotated.edge_radii_voxels()
+            threshold = self._LEGACY_THRESHOLDS['restrictive_vein_radius_vx']
+
+        return np.logical_and(radii >= threshold, is_in_vein_range)
 
     @requires_graph('annotated')
-    def _pre_filter_arteries(self, huge_vein, min_size):
+    def _pre_filter_arteries(self, arteries_min_noise_edges: int):
         """
-        Remove capillaries and veins from arteries
+        Remove components where too few edges are arteries
 
         Parameters
         ----------
-        min_size : (int)  below is capillary
+        arteries_min_noise_edges : (int)
+            below is capillary
 
         Returns
         -------
@@ -960,23 +1378,30 @@ class VesselGraphProcessor(PipelineOrchestrator):
         artery_graph = self.graph_annotated.sub_graph(edge_filter=artery, view=True)
         artery_graph_edge, edge_map = artery_graph.edge_graph(return_edge_map=True)
         artery_components, artery_size = artery_graph_edge.label_components(return_vertex_counts=True)
-        too_small = edge_map[np.in1d(artery_components, np.where(artery_size < min_size)[0])]
+        too_small = edge_map[np.in1d(artery_components, np.where(artery_size < arteries_min_noise_edges)[0])]
         artery[too_small] = False
-        artery[huge_vein] = False
         return artery
 
     @requires_graph('annotated')
-    def _post_filter_veins(self, restrictive_veins, min_vein_radius=6.5):
-        radii = self.graph_annotated.edge_property('radii')
+    def _post_filter_veins(self, restrictive_veins, min_vein_radius_um: float | int):
         artery = self.graph_annotated.edge_property('artery')
 
-        large_vessels = radii >= min_vein_radius
+        level = self._graph_radius_level(self.graph_annotated)
+        if level != VesselGraphProcessor.RadiusLevel.VOXELS:
+            radii = self.graph_annotated.edge_radii_um()
+            threshold = min_vein_radius_um
+        else:
+            self._legacy_warn('_post_filter_veins')
+            radii = self.graph_annotated.edge_radii_voxels()
+            threshold = self._LEGACY_THRESHOLDS['permissive_vein_radius_vx']
+
+        large_vessels = radii >= threshold
         permissive_veins = np.logical_and(np.logical_or(restrictive_veins, large_vessels), np.logical_not(artery))
         return permissive_veins
 
     # TRACING
     @requires_graph('annotated')
-    def _trace_arteries(self, veins, max_tracing_iterations=5):
+    def _trace_arteries(self, veins, max_tracing_iterations: int = 5):
         """
         Trace arteries by hysteresis thresholding
         Keeps small arteries that are too weakly immuno-positive but still too big to be capillaries
@@ -987,59 +1412,102 @@ class VesselGraphProcessor(PipelineOrchestrator):
         veins
         """
         artery = self.graph_annotated.edge_property('artery')
+
+        level = self._graph_radius_level(self.graph_annotated)
+        if level != VesselGraphProcessor.RadiusLevel.VOXELS:
+            radii = self.graph_annotated.edge_radii_um()
+            trace_radius = self.config['vessel_type_postprocessing']['tracing']['artery_trace_radius_um']
+        else:
+            self._legacy_warn('_trace_arteries')
+            radii = self.graph_annotated.edge_radii_voxels()
+            trace_radius = self._LEGACY_THRESHOLDS['artery_trace_radius_vx']
+
         condition_args = {
             'distance_to_surface': self.graph_annotated.edge_property('distance_to_surface'),
-            'distance_threshold': 15,
+            'distance_threshold': self.config['vessel_type_postprocessing']['tracing']['distance_to_surface_min'],
             'vein': veins,
-            'radii': self.graph_annotated.edge_property('radii'),
-            'artery_trace_radius': 4,  # FIXME: param
+            'radii': radii,
+            'artery_trace_radius': trace_radius,
             'artery_intensity': self.graph_annotated.edge_property('artery_raw'),
-            'artery_intensity_min': 200  # FIXME: param
+            'artery_intensity_min': self.config['vessel_type_postprocessing']['tracing']['artery_intensity_min']
         }
 
         def continue_edge(graph, edge, **kwargs):
             if kwargs['distance_to_surface'][edge] < kwargs['distance_threshold'] or kwargs['vein'][edge]:
                 return False
             else:
-                return kwargs['radii'][edge] >= kwargs['artery_trace_radius'] and \
-                       kwargs['artery_intensity'][edge] >= kwargs['artery_intensity_min']
+                return (kwargs['radii'][edge] >= kwargs['artery_trace_radius'] and
+                        kwargs['artery_intensity'][edge] >= kwargs['artery_intensity_min'])
 
         artery_traced = graph_processing.trace_edge_label(self.graph_annotated, artery,
-                                                          condition=continue_edge, max_iterations=max_tracing_iterations,
+                                                          condition=continue_edge,
+                                                          max_iterations=max_tracing_iterations,
                                                           **condition_args)
-        # artery_traced = graph.edge_open_binary(graph.edge_close_binary(artery_traced, steps=1), steps=1)
+
         self.graph_annotated.define_edge_property('artery', artery_traced)
 
     @requires_graph('annotated')
-    def _trace_veins(self, max_tracing_iterations=5):
+    def _trace_veins(self, max_tracing_iterations: int = 5):
         """
         Trace veins by hysteresis thresholding - stop before arteries
         """
         min_distance_to_artery = 1
-
         artery = self.graph_annotated.edge_property('artery')
-        radii = self.graph_annotated.edge_property('radii')
+        artery_expanded = self.graph_annotated.edge_dilate_binary(artery, steps=min_distance_to_artery)
+
+        trace_cfg = self.config['vessel_type_postprocessing']['tracing']
+        pre_filt_cfg = self.config['vessel_type_postprocessing']['pre_filtering']
+
+        level = self._graph_radius_level(self.graph_annotated)
+        if level != VesselGraphProcessor.RadiusLevel.VOXELS:
+            radii = self.graph_annotated.edge_radii_um()
+            trace_radius = trace_cfg['vein_trace_radius_um']
+        else:
+            self._legacy_warn('_trace_veins')
+            radii = self.graph_annotated.edge_radii_voxels()
+            trace_radius = self._LEGACY_THRESHOLDS['vein_trace_radius_vx']
+
+        artery_intensity = self.graph_annotated.edge_property('artery_raw') if self.use_arteries_for_graph else None
+        vein_intensity = self.graph_annotated.edge_property('vein_raw') if self.veins_channel else None
+
         condition_args = {
-            'artery_expanded': self.graph_annotated.edge_dilate_binary(artery, steps=min_distance_to_artery),
+            'artery_expanded': artery_expanded,
             'radii': radii,
-            'vein_trace_radius': 5  # FIXME: param
+            'artery_intensity': artery_intensity,
+            'vein_trace_radius': trace_radius,
+            'vein_intensity': vein_intensity,
+            'vein_intensity_range': tuple(pre_filt_cfg['vein_intensity_range_on_arteries_ch']),
+            'vein_intensity_min': trace_cfg['vein_intensity_min']
         }
 
         def continue_edge(graph, edge, **kwargs):
-            if kwargs['artery_expanded'][edge]:
+            if kwargs['artery_expanded'][edge]:  # too close to artery
                 return False
             else:
-                return kwargs['radii'][edge] >= kwargs['vein_trace_radius']
+                radius_ok = kwargs['radii'][edge] >= kwargs['vein_trace_radius']
+                if not radius_ok:
+                    return False
+                else:
+                    # If we have vein signal: must be positive
+                    if kwargs['vein_intensity'] is not None:
+                        if kwargs['vein_intensity'][edge] < kwargs['vein_intensity_min']:
+                            return False
+                    # If we have artery signal: must be low
+                    if kwargs['artery_intensity'] is not None:
+                        lo, hi = kwargs['vein_intensity_range_on_arteries_ch']
+                        if not (lo <= kwargs['artery_intensity'][edge] <= hi):
+                            return False
+                    return True
 
-        vein_traced = graph_processing.trace_edge_label(self.graph_annotated, self.graph_annotated.edge_property('vein'),
-                                                        condition=continue_edge, max_iterations=max_tracing_iterations,
-                                                        **condition_args)
-        # vein_traced = graph.edge_open_binary(graph.edge_close_binary(vein_traced, steps=1), steps=1)
+        vein_traced = graph_processing.trace_edge_label(
+            self.graph_annotated, self.graph_annotated.edge_property('vein'),
+            condition=continue_edge, max_iterations=max_tracing_iterations,
+            **condition_args)
 
         self.graph_annotated.define_edge_property('vein', vein_traced)
 
     @requires_graph('annotated')
-    def _remove_small_vessel_components(self, vessel_name, min_vessel_size=30):
+    def _remove_small_vessel_components(self, vessel_name, min_vessel_size: int = 30):
         """
         Filter out small components that will become capillaries
         """
@@ -1064,26 +1532,34 @@ class VesselGraphProcessor(PipelineOrchestrator):
         """
         if self.use_arteries_for_graph:
             cfg = self.config['vessel_type_postprocessing']
-            # Definitely a vein because too big
-            restrictive_veins = self._pre_filter_veins(cfg['pre_filtering']['vein_intensity_range_on_arteries_ch'],
-                                                       min_vein_radius=cfg['pre_filtering']['restrictive_vein_radius'])
 
-            artery = self._pre_filter_arteries(restrictive_veins, min_size=cfg['pre_filtering']['arteries_min_radius'])
+            artery = self._pre_filter_arteries(cfg['pre_filtering']['arteries_min_noise_edges'])
+
+            # Definitely a vein because too big
+            restrictive_veins = self._pre_filter_veins(
+                cfg['pre_filtering']['vein_intensity_range_on_arteries_ch'],
+                min_vein_radius_um=cfg['pre_filtering']['restrictive_vein_radius_um'])
+            artery[restrictive_veins] = False
+
             self.graph_annotated.define_edge_property('artery', artery)
 
             # Not huge vein but not an artery so still a vein (with temporary radius for artery tracing)
             tmp_veins = self._post_filter_veins(restrictive_veins,
-                                                min_vein_radius=cfg['pre_filtering']['permissive_vein_radius'])
+                                                min_vein_radius_um=cfg['pre_filtering']['permissive_vein_radius_um'])
             self._trace_arteries(tmp_veins, max_tracing_iterations=cfg['tracing']['max_arteries_iterations'])
 
             # The real vein size filtering
-            vein = self._post_filter_veins(restrictive_veins, min_vein_radius=cfg['pre_filtering']['final_vein_radius'])
+            vein = self._post_filter_veins(restrictive_veins,
+                                           min_vein_radius_um=cfg['pre_filtering']['final_vein_radius_um'])
             self.graph_annotated.define_edge_property('vein', vein)
 
             self._trace_veins(max_tracing_iterations=cfg['tracing']['max_veins_iterations'])
 
-            self._remove_small_vessel_components('artery', min_vessel_size=cfg['capillaries_removal']['min_artery_size'])
-            self._remove_small_vessel_components('vein', min_vessel_size=cfg['capillaries_removal']['min_vein_size'])
+            #  Clean up fragments (veins or arteries) that tracing extended but not enough to be biologically meaningful.
+            self._remove_small_vessel_components('artery',
+                                                 min_vessel_size=cfg['capillaries_removal']['min_artery_component_edges'])
+            self._remove_small_vessel_components('vein',
+                                                 min_vessel_size=cfg['capillaries_removal']['min_vein_component_edges'])
 
             self.graph_annotated.save(self.get_path('graph', channel=self.parent_channels))
             self.graph_traced = self.graph_annotated
@@ -1098,7 +1574,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
         }
         return voxelize_branch_parameter
 
-    def __voxelize(self, vertices, voxelize_branch_parameter):
+    def __voxelize(self, vertices, voxelize_branch_parameter: dict[str, Any]):
         density_path = self.get_path('density', channel=self.parent_channels, asset_sub_type='branches')
         clearmap_io.delete_file(density_path)
         self.branch_density = voxelization.voxelize(vertices,
@@ -1134,11 +1610,12 @@ class VesselGraphProcessor(PipelineOrchestrator):
             vertices = vertices[combined.as_mask('vertex')]
 
         if weight_by_radius:
-            voxelize_branch_parameter.update(weights=graph.vertex_radii())
+            voxelize_branch_parameter.update(weights=graph.vertex_radii_units())
 
         self.__voxelize(vertices, voxelize_branch_parameter)
 
     def plot_voxelization(self, parent):
+        from ClearMap.Visualization.Qt import Plot3d as q_p3d
         return q_p3d.plot(self.get_path('density', channel=self.parent_channels, asset_sub_type='branches'),
                           arrange=False, parent=parent, lut='flame')
 
@@ -1149,13 +1626,16 @@ class VesselGraphProcessor(PipelineOrchestrator):
         """
         coordinates = self.graph_traced.vertex_property('coordinates')
         df = pd.DataFrame({'x': coordinates[:, 0], 'y': coordinates[:, 1], 'z': coordinates[:, 2]})
-        df['radius'] = self.graph_traced.vertex_property('radii')
         df['degree'] = self.graph_traced.vertex_degrees()
+
+        df['radius_vx'] = self.graph_traced.vertex_radii_voxels()
+        if 'radius_units' in self.graph_traced.vertex_properties:
+            df['radius_um'] = self.graph_traced.vertex_radii_units()
 
         if self.registration_processor.was_registered:
             annotator = self.registration_processor.annotators[self.parent_channels[0]]
             coordinates_transformed = self.graph_traced.vertex_property('coordinates_atlas')
-            atlas_resolution = self.get_alignment_ref_channel_reg_cfg['resampled_resolution']
+            atlas_resolution = self.get_alignment_ref_channel_reg_cfg()['resampled_resolution']
             extra_columns = annotator.get_columns(coordinates_transformed, atlas_resolution,
                                                   self.graph_traced.vertex_property('annotation'))
             df = pd.concat([df, extra_columns], axis=1)
@@ -1191,7 +1671,9 @@ class VesselGraphProcessor(PipelineOrchestrator):
                                      title=f'Structure {structure_name} graph',
                                      plot_type=plot_type, region_color=region_color)
 
-    def plot_graph_chunk(self, graph_chunk, plot_type='mesh', title='sub graph', region_color=None, show=True, n_max_vertices=300000):
+    def plot_graph_chunk(self, graph_chunk, plot_type='mesh', title='sub graph', region_color=None,
+                         show=True, n_max_vertices=MAX_PLOT_VERTICES):
+        from ClearMap.Visualization.Vispy import plot_graph_3d  # WARNING: vispy dependency
         if plot_type == 'line':
             scene = plot_graph_3d.plot_graph_line(graph_chunk, vertex_colors=region_color, title=title,
                                                   show=show, bg_color=self.machine_config['three_d_plot_bg'])

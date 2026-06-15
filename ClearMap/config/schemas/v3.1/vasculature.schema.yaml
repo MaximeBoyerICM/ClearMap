@@ -15,6 +15,7 @@ $defs:
         additionalProperties: true
         properties:
           run: { type: boolean }
+          save:  { type: boolean }
           clip_range: { $ref: "./typedefs.schema.yaml#/$defs/numberPairPositive" }
           threshold: { type: ["number", "null"] }
       smooth:
@@ -22,17 +23,27 @@ $defs:
         additionalProperties: true
         properties:
           run: { type: boolean }
+          save:  { type: boolean }
       binary_fill:
         type: object
         additionalProperties: true
         properties:
           run: { type: boolean }
+          save:  { type: boolean }
       deep_fill:
         type: object
         additionalProperties: true
         properties:
           run: { type: boolean }
+          save:  { type: boolean }
           resample_factor: { type: number, exclusiveMinimum: 0 }
+      step_order:
+        type: array
+        items:
+          type: string
+          enum: [ binarize, smooth, binary_fill, deep_fill ]
+        minItems: 1
+        uniqueItems: true
 
   binarizationChannelsContainer:
     type: object
@@ -117,16 +128,21 @@ properties:
         additionalProperties: true
         properties:
           vein_intensity_range_on_arteries_ch: { $ref: "./typedefs.schema.yaml#/$defs/intPair" }
-          restrictive_vein_radius: { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
-          permissive_vein_radius:  { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
-          final_vein_radius:       { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
-          arteries_min_radius:     { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
+          restrictive_vein_radius_um:   { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
+          permissive_vein_radius_um:    { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
+          final_vein_radius_um:         { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
+          arteries_min_noise_edges: { $ref: "./typedefs.schema.yaml#/$defs/positiveInteger" }
       tracing:
         type: object
         additionalProperties: true
         properties:
           max_arteries_iterations: { $ref: "./typedefs.schema.yaml#/$defs/positiveInteger" }
           max_veins_iterations:    { $ref: "./typedefs.schema.yaml#/$defs/positiveInteger" }
+          artery_trace_radius_um:  { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
+          vein_trace_radius_um:    { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
+          distance_to_surface_min: { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
+          vein_intensity_min:    { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
+          artery_intensity_min:    { $ref: "./typedefs.schema.yaml#/$defs/positiveNumber" }
       capillaries_removal:
         type: object
         additionalProperties: true
@@ -175,3 +191,27 @@ properties:
             additionalProperties: true
             properties:
               block_processing: { $ref: "./typedefs.schema.yaml#/$defs/blockProcessing" }
+      graph_construction:
+        type: object
+        additionalProperties: true
+        properties:
+          skeletonize:
+            type: object
+            additionalProperties: true
+            properties:
+              n_processes: { $ref: "./typedefs.schema.yaml#/$defs/nProcessesType" }
+          build:
+            type: object
+            additionalProperties: true
+            properties:
+              n_processes: { $ref: "./typedefs.schema.yaml#/$defs/nProcessesType" }
+          clean:
+            type: object
+            additionalProperties: true
+            properties:
+              n_processes: { $ref: "./typedefs.schema.yaml#/$defs/nProcessesType" }
+          reduce:
+            type: object
+            additionalProperties: true
+            properties:
+              n_processes: { $ref: "./typedefs.schema.yaml#/$defs/nProcessesType" }
