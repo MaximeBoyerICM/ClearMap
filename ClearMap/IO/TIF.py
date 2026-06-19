@@ -6,14 +6,18 @@ Note
 ----
 This module relies on the tifffile library.
 """
+from __future__ import annotations
+
 __author__ = 'Christoph Kirst <christoph.kirst.ck@gmail.com>, Charly Rousseau <charly.rousseau@icm-institute.org>'
 __license__ = 'GPLv3 - GNU General Public License v3 (see LICENSE.txt)'
 __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
 
+import re
 import warnings
 from functools import cached_property
+from typing import NamedTuple, Optional, List, Dict, Tuple, Any
 
 import numpy as np
 from tifffile import tifffile
@@ -179,21 +183,70 @@ class Source(AbstractSource):
 
     @cached_property
     def _metadata_type(self):
+        # Prefer OME if tifffile recognizes it
+        if getattr(self._tif, 'is_ome', False):
+            return 'ome_metadata'
+
         populated_metadata = [f'{t}_metadata' for t in self._tif.flags
                               if getattr(self._tif, f'{t}_metadata', None) is not None]
+
         if not populated_metadata:
+            # Fallback: sniff OME XML in the first page's description
+            if self._has_ome_description():
+                return 'ome_metadata'
             return None
-        elif len(populated_metadata) > 1:
+        elif len(populated_metadata) > 1:  # If multiple types, prefer OME if present
             warnings.warn(f'Multiple metadata types found in tif file {self.location}!; metadata: {populated_metadata}')
+            if 'ome_metadata' in populated_metadata:
+                return 'ome_metadata'
         return populated_metadata[0]
+
+    def _has_ome_description(self):
+        """Check whether the first page's description contains OME XML."""
+        try:
+            if self._tif.pages:
+                desc = getattr(self._tif.pages[0], 'description', '') or ''
+                return '<OME ' in desc or 'openmicroscopy.org' in desc
+        except Exception:
+            pass
+        return False
 
     def get_raw_metadata_dictionary(self):
         if not self._metadata_type:
             return {}
-        md = getattr(self._tif, self._metadata_type) or {}
-        if self._tif.is_ome:
+
+        md = getattr(self._tif, self._metadata_type, None)
+
+        # Fallback: OME XML lives in the page description
+        if md is None and self._metadata_type == 'ome_metadata':
+            md = self._extract_ome_from_description()
+
+        if md is None:
+            md = {}
+
+        # Parse XML string → dict
+        if isinstance(md, str) and ('<OME ' in md or 'openmicroscopy.org' in md):
             md = tifffile.xml2dict(md).get('OME', {})
+        elif getattr(self._tif, 'is_ome', False) and isinstance(md, str):
+            md = tifffile.xml2dict(md).get('OME', {})
+
+        if not isinstance(md, dict):
+            if isinstance(md, (list, tuple)) and len(md) == 1:
+                md = md[0] if md else {}
+            else:
+                raise ValueError(f'Unexpected metadata format in tif file {self.location}: {type(md)}')
         return md
+
+    def _extract_ome_from_description(self):
+        """Extract raw OME XML string from the first page description."""
+        try:
+            if self._tif.pages:
+                desc = getattr(self._tif.pages[0], 'description', '') or ''
+                if '<OME ' in desc:
+                    return desc
+        except Exception:
+            pass
+        return None
 
     def metadata(self, info=('shape', 'resolution', 'overlap')):
         """Returns metadata from this tif file.
@@ -288,27 +341,52 @@ class VirtualSource(AbstractVirtualSource):
 ###############################################################################
 # ## TIF Parsers
 ###############################################################################
+class TileRecord(NamedTuple):
+    basename: str
+    channel: int
+    stage_x: float
+    stage_y: float
+    ix: Optional[int]  # tile X index
+    iy: Optional[int]  # tile Y index
+
 class BaseMetadataParser:
     def __init__(self, source, metadata, info_categories):
         self.source = source
         self.metadata = metadata
         if isinstance(info_categories, str):
             info_categories = [info_categories]
-        self.info = {k: None for k in info_categories}
+        self.info: Dict[str, Dict | Any | None] = {k: None for k in info_categories}
 
     def parse(self):
-        if 'shape' in self.info:
-            self.parse_pixel_metadata()
-        if 'resolution' in self.info:
-            self.parse_resolution()
-        if 'overlap' in self.info:
-            self.parse_overlap()
-        if 'description' in self.info:
-            self.parse_description()
-        if 'tile_configuration' in self.info:
-            self.parse_tile_configuration()
-        if 'date' in self.info:
-            self.parse_date()
+        sequence = [
+            'order',  # First because used by shape and resolution
+            'shape',  # calls parse_pixel_metadata() (order + shape)
+            'resolution',
+            'overlap',
+            'description',
+            'tile_configuration',
+            'date',
+            'channels_excitation',
+            'stitching',
+        ]
+
+        # legacy aliases (so requesting 'shape' still calls parse_pixel_metadata)
+        special = {'shape': self.parse_pixel_metadata}
+
+        for key in sequence:  # FIXME: handle dependency chains
+            if key in self.info:
+                fn = special.get(key) or getattr(self, f'parse_{key}')
+                if fn is not None:
+                    fn()
+            # else:
+            #     fn = getattr(self, f'parse_{key}', None)
+            #     if fn:
+            #         print(f'Warning: key not found in info_categories: {key}.'
+            #               f'Trying to force call parse_{key} anyway.')
+            #         try:
+            #             fn()
+            #         except KeyError as err:
+            #             print(f'Warning: could not parse {key}: {err}')
 
     def update_info(self, name, keys, mdict, astype):
         value = []
@@ -322,6 +400,14 @@ class BaseMetadataParser:
                 value.append(astype(v))
         if value:
             self.info[name] = tuple(value)
+
+    # --- stubs for keys that only some parsers implement ---
+
+    def parse_channels_excitation(self):
+        self.info['channels_excitation'] = None
+
+    def parse_stitching(self):
+        self.info['stitching'] = None
 
     def parse_order(self):
         self.info['order'] = self.pixels_metadata.get('DimensionOrder', None)
@@ -361,21 +447,68 @@ class BaseMetadataParser:
         self.parse_shape()
 
     def parse_resolution(self):
-        self.info['resolution'] = tuple(float(self.pixels_metadata[f'PhysicalSize{dim}'])
-                                        for dim in self.info['order'] if dim in 'XYZ')
+        axes = [ ax for ax in self.info['order'] if ax in 'XYZ' ]
+        self.info['resolution'] = tuple(float(self.pixels_metadata[f'PhysicalSize{ax}']) for ax in axes)
 
     def parse_date(self):
-        self.info['date'] = self.metadata.get('Image', {}).get('CreationDate', None)
+        img_meta = self.metadata.get('Image', {})
+        self.info['date'] = img_meta.get('CreationDate', None)
 
     def parse_description(self):
+        # if self.source.pages_mode:
+        #     desc = self.source._tif.pages[0].description
+        # else:
+        #     desc = self.source.series.description
+        # if desc:
+        #     self.info['description'] = desc
+        # else:
+        #     self.info['description'] = self.metadata.get('Image', {}).get('Description', None)
+        desc = None
+
+        # Choose a representative page
+        page = None
+        tif = self.source._tif
+
         if self.source.pages_mode:
-            desc = self.source._tif.pages[0].description
+            # For OME or true pages-mode, page 0 is usually authoritative
+            if tif.pages:
+                page = tif.pages[0]
         else:
-            desc = self.source.series.description
-        if desc:
-            self.info['description'] = desc
-        else:
-            self.info['description'] = self.metadata.get('Image', {}).get('Description', None)
+            # For shaped / ImageJ / ClearMap series, try the series pages first
+            try:
+                series = self.source.series
+            except Exception:
+                series = None
+
+            if series is not None:
+                # tifffile.TiffPageSeries typically has .pages and/or .keyframe
+                if hasattr(series, "keyframe") and series.keyframe is not None:
+                    page = series.keyframe
+                elif hasattr(series, "pages") and series.pages:
+                    page = series.pages[0]
+
+            # Fallback: global first page
+            if page is None and tif.pages:
+                page = tif.pages[0]
+
+        # Try description from the chosen page
+        if page is not None:
+            if hasattr(page, "description") and page.description:
+                desc = page.description
+            # Some tifffile versions expose description via tags only
+            elif hasattr(page, "tags") and "ImageDescription" in page.tags:
+                try:
+                    desc = page.tags["ImageDescription"].value
+                except Exception:
+                    pass
+
+        # Fallback to high-level metadata dict (OME/ImageJ)
+        if not desc:
+            desc = (self.metadata
+                    .get("Image", {})
+                    .get("Description", None))
+
+        self.info["description"] = desc
 
     def parse_tile_configuration(self):
         warnings.warn(f"Tile configuration parsing is not available for {self.__class__.__name__}, skipping!")
@@ -395,10 +528,52 @@ class OMEMetadataParser(BaseMetadataParser):
     generated by either the UltraMicroscopeII or the Blaze
     light-sheet microscopes from LaVision BioTec (now Miltenyi Biotec).
     """
+    _RE_TILECFG = re.compile(r"\s*(?P<f>[^;]+?)\s*;;\s*\(\s*(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)\s*,\s*(?P<c>\d+)\s*\)\s*")
+    _RE_YX = re.compile(r"(?<!\d)(?P<iy>\d{2})\s*x\s*(?P<ix>\d{2})(?!\d)")
 
     @cached_property
     def pixels_metadata(self):
         return self.metadata.get('Image', {}).get('Pixels', {})
+
+    @cached_property
+    def img_custom_attrs(self):
+        return self.metadata.get('Image', {}).get('CustomAttributes', {})
+
+    def _props_map(self):
+        props = self.img_custom_attrs.get('Properties', {}).get('prop', [])
+        out = {}
+        for p in props:
+            label = p.get('label') or p.get('fname') or ''
+            val = p.get('Value')
+            if val is None:
+                continue
+            try:
+                out[label] = float(val)
+            except Exception:
+                out[label] = val
+        return out
+
+    def _declared_overlap_px(self, sx, sy, props):
+        # prefer explicit pixels, else convert percent → px
+        px_x = (props.get('xyz-Table UserRequestedOverlapInPixelX')
+                or props.get('xyz-Table Overlap In Pixel For X Axis Requested By User')
+                or props.get('xyz-Table X Overlap (Pixel)'))
+        px_y = (props.get('xyz-Table UserRequestedOverlapInPixelY')
+                or props.get('xyz-Table Overlap In Pixel For Y Axis Requested By User')
+                or props.get('xyz-Table Y Overlap (Pixel)'))
+        if px_x is None:
+            pct_x = props.get('xyz-Table X Overlap') or props.get('xyz-Table XY Overlap (X)')
+            if isinstance(pct_x, (int, float)): px_x = sx * (pct_x / 100.0)
+        if px_y is None:
+            pct_y = props.get('xyz-Table Y Overlap')
+            if isinstance(pct_y, (int, float)): px_y = sy * (pct_y / 100.0)
+        return (None if px_x is None else round(px_x, 2),
+                None if px_y is None else round(px_y, 2))
+
+    def _min_pos_step(self, vals, eps=1e-9):
+        vals = sorted(set(round(v, 6) for v in vals))
+        diffs = [b - a for a, b in zip(vals, vals[1:]) if b - a > eps]
+        return len(vals), (min(diffs) if diffs else None)
 
     def parse_overlap(self):
         custom_md = self.metadata.get('CustomAttributes', {}).get('PropArray', {})  # UM2
@@ -406,20 +581,155 @@ class OMEMetadataParser(BaseMetadataParser):
             overlap_keys = [f'xyz-Table_{dim}_Overlap.Value' for dim in 'XY']
             self.update_info('overlap', overlap_keys, custom_md, float)
         else:
-            custom_md = self.metadata.get('CustomAttributes', {}).get('Properties', {}).get('prop', {})
-            overlap_keys = [f'xyz-Table {dim} Overlap' for dim in 'XY']
-            overlaps = [float(label.get('Value')) for label in custom_md
-                        if label.get('label') in overlap_keys]
-            self.info['overlap'] = tuple(overlaps) if overlaps else None
+            # Prefer pixel props if present; else percent (old behavior)
+            props = self._props_map()
+            sz_x = int(self.pixels_metadata.get('SizeX', 0))
+            sz_y = int(self.pixels_metadata.get('SizeY', 0))
+            ovrlp_x, ovrlp_y = self._declared_overlap_px(sz_x, sz_y, props)
+            if ovrlp_x is not None or ovrlp_y is not None:
+                self.info['overlap'] = (ovrlp_x, ovrlp_y)
+            else:
+                custom_md = self.metadata.get('CustomAttributes', {}).get('Properties', {}).get('prop', {})
+                overlap_keys = [f'xyz-Table {dim} Overlap' for dim in 'XY']
+                overlaps = [float(label.get('Value')) for label in custom_md
+                            if label.get('label') in overlap_keys]
+                self.info['overlap'] = tuple(overlaps) if overlaps else None
 
-    def parse_tile_configuration(self):
-        tile_cfg_txt = (self.metadata.get('Image', {}).get('CustomAttributes', {})
-                        .get('TileConfiguration', {}).get('TileConfiguration', ''))
-        if tile_cfg_txt:
-            tile_cfg_txt = [ln.strip() for ln in tile_cfg_txt[1:].split(')') if ln]
-            tile_cfg = [ln.split(';;') for ln in tile_cfg_txt]
-            tile_cfg = [(ln[0], ln[1][1:]) for ln in tile_cfg]
-            self.info['tile_configuration'] = tile_cfg
+    def parse_channels_excitation(self):
+        chans = self.pixels_metadata.get('Channel', [])
+        # xml2dict returns dict or list; normalize
+        if isinstance(chans, dict):
+            chans = [chans]
+        wavelengths = {}
+        for i, ch in enumerate(chans or []):
+            wl = ch.get('ExcitationWavelength')
+            wavelengths[i] = None if wl in (None, '') else int(wl)
+        self.info['channels_excitation'] = wavelengths or None
+
+    def _filename_axes_map(self) -> Dict[Tuple[str, int], Tuple[int, int]]:
+        fam = self.img_custom_attrs.get('FilenameAxesMap', {})
+        fam_str = fam.get('FilenameAxesMap', '') if isinstance(fam, dict) else ''
+        out: Dict[Tuple[str, int], Tuple[int, int]] = {}
+        for part in [p for p in fam_str.split('/') if p.strip()]:
+            try:
+                fn, idxs = part.split('?')
+                c, x, y = idxs.split(',')
+                out[(fn, int(c))] = (int(x), int(y))
+            except Exception:
+                pass
+        return out
+
+    def _indices_from_name(self, basename: str, *, filename_order='YX') -> Tuple[Optional[int], Optional[int]]:
+        found = list(self._RE_YX.findall(basename))
+        if not found:
+            return None, None
+        iy2, ix2 = map(int, found[-1])
+        return (ix2, iy2) if filename_order == 'YX' else (iy2, ix2)
+
+    def parse_tile_configuration(self, *, filename_order='YX'):  #  FIXME: pass arg
+        """
+        Build a dict[channel][(ix,iy)] = {
+            'filename': <basename>,
+            'stage_x': float, 'stage_y': float,
+            'relative_x': float, 'relative_y': float
+        }
+
+        - (ix,iy) are taken from the filename 'YY x XX' pattern; if absent, from FilenameAxesMap.
+        - relative_* are normalized so that min(stage) per axis is 0 across all tiles.
+        """
+
+        # Parse OME xml
+        tile_cfg = self.img_custom_attrs.get('TileConfiguration', {})
+        tile_cfg_str = tile_cfg.get('TileConfiguration', '') if isinstance(tile_cfg, dict) else ''
+        idx_map = self._filename_axes_map()
+
+        records: List[TileRecord] = []
+        if tile_cfg_str:
+            for m in self._RE_TILECFG.finditer(tile_cfg_str):
+                base = m.group('f')
+                c = int(m.group('c'))
+                x, y = [float(m.group(axis)) for axis in 'xy']
+                ix, iy = self._indices_from_name(base, filename_order=filename_order)
+                if ix is None or iy is None:
+                    ix, iy = idx_map.get((base, c), (None, None))
+                records.append(TileRecord(base, c, x, y, ix, iy))
+
+        if not records:
+            self.info['tile_configuration'] = None
+            return None
+
+        # Normalize stage coords so stitched image starts at 0,0
+        min_x = min(r.stage_x for r in records)
+        min_y = min(r.stage_y for r in records)
+
+        # Build dict[channel][(ix,iy)] = {...}
+        out: Dict[int, Dict[Tuple[int, int], dict]] = {}
+        for r in records:
+            if r.ix is None or r.iy is None:  # If TileConfiguration -> all tiles must have indices
+                raise ValueError(f'Cannot parse tile indices for tile "{r.basename}"!')
+            ch_map = out.setdefault(r.channel, {})
+            ch_map[(r.ix, r.iy)] = {
+                'filename': r.basename,
+                'absolute_x': r.stage_x,
+                'absolute_y': r.stage_y,
+                'relative_x': round(r.stage_x - min_x, 3),
+                'relative_y': round(r.stage_y - min_y, 3),
+            }
+
+        out = out or None
+        self.info['tile_configuration'] = out
+        return out
+
+    def _grid_from_tile_cfg(self, tile_cfg: dict) -> tuple[int, int]:
+        xs, ys = set(), set()
+        for mapping in tile_cfg.values():
+            for (ix, iy) in mapping.keys():
+                xs.add(ix)
+                ys.add(iy)
+        nx = (max(xs) + 1) if xs else 0
+        ny = (max(ys) + 1) if ys else 0
+        return nx, ny
+
+    def parse_stitching(self, *, filename_order='YX'):
+        tile_cfg = self.info.get('tile_configuration')
+        if tile_cfg is None:
+            tile_cfg = self.parse_tile_configuration(filename_order=filename_order)
+        tile_cfg = tile_cfg or {}  # ensure iterable
+
+        nx, ny = self._grid_from_tile_cfg(tile_cfg)
+
+        # Build 2-D tiles[ix][iy] with per-cell files & norm (relative coords)
+        tiles = [[None for _ in range(ny)] for _ in range(nx)]
+        for ch, mapping in tile_cfg.items():
+            for (ix, iy), rec in mapping.items():
+                cell = tiles[ix][iy]
+                if cell is None:
+                    cell = {'files': {}, 'norm': (rec['relative_x'], rec['relative_y'])}
+                    tiles[ix][iy] = cell
+                cell['files'][ch] = rec['filename']
+
+        # overlaps: declared (pixels first; else %→px), derived from relative spacing
+        sz_x = int(self.pixels_metadata.get('SizeX', 0))
+        sz_y = int(self.pixels_metadata.get('SizeY', 0))
+        x_voxel_spacing = float(self.pixels_metadata.get('PhysicalSizeX', 'nan'))
+        y_voxel_spacing = float(self.pixels_metadata.get('PhysicalSizeY', 'nan'))
+
+        declared = self._declared_overlap_px(sz_x, sz_y, self._props_map())
+
+        # derived from RELATIVE coords (same units as stage; differences are valid)
+        rel_xs = sorted({rec['relative_x'] for mp in tile_cfg.values() for rec in mp.values()})
+        rel_ys = sorted({rec['relative_y'] for mp in tile_cfg.values() for rec in mp.values()})
+        _, dx = self._min_pos_step(rel_xs)
+        _, dy = self._min_pos_step(rel_ys)
+        ovrlp_x = round(sz_x - (dx / x_voxel_spacing), 2) if (dx and x_voxel_spacing == x_voxel_spacing) else None
+        ovrlp_y = round(sz_y - (abs(dy) / y_voxel_spacing), 2) if (dy and y_voxel_spacing == y_voxel_spacing) else None
+        derived = (ovrlp_x, ovrlp_y)
+
+        self.info['stitching'] = {
+            'grid': (nx, ny),
+            'overlap_px': {'declared': declared, 'derived': derived},
+            'tiles': tiles
+        }
 
 
 class ImageJMetadataParser(BaseMetadataParser):
@@ -484,6 +794,25 @@ class ImageJMetadataParser(BaseMetadataParser):
             raise ValueError(f'Unknown metadata type {self.source._metadata_type} and format: {md_info[0]};'
                              f' info: {md_info}')
 
+    def parse_resolution(self):
+        # ImageJ often has unit/spacing but not PhysicalSizeX/Y
+        if 'PhysicalSizeX' in self.pixels_metadata:
+            super().parse_resolution()
+            return
+
+        # Optional: salvage Z from ImageJ 'spacing'
+        order = self.info.get('order') or self.pixels_metadata.get('DimensionOrder') or 'XYZ'
+        axes = [ax for ax in order if ax in 'XYZ']
+
+        z = self.metadata.get('spacing', None)
+        if z is not None and 'Z' in axes: # Only fill Z; keep XY unknown rather than inventing values
+            res = []
+            for ax in axes:
+                res.append(float(z) if ax == 'Z' else None)
+            self.info['resolution'] = tuple(res)
+        else:
+            self.info['resolution'] = None
+
 
 class ClearMapMetadataParser(BaseMetadataParser):
     """
@@ -493,6 +822,12 @@ class ClearMapMetadataParser(BaseMetadataParser):
     files which might lack some of the metadata fields but where the axes
     order is bound to be 'XYZ'.
     """
+    def parse_resolution(self):
+        if 'PhysicalSizeX' in self.pixels_metadata:
+            super().parse_resolution()
+        else:
+            self.info['resolution'] = None
+
     def parse_order(self):
         # parsed_info = self.metadata[0]  # FIXME: check, which is best
         super().parse_order()

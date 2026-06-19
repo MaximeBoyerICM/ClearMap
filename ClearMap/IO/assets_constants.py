@@ -135,6 +135,12 @@ CHANNELS_ASSETS_TYPES_CONFIG = {
         'relevant_pipelines': ['CellMap'],  # TODO: tune relevance for subsets
         'sub_types': ['raw', 'filtered', 'shape', 'bkg']
     },
+    'vertices': {
+        'file_format_category': 'table',
+        'resource_type': 'results',
+        'relevant_pipelines': ['TubeMap'],
+        'extensions': ['.feather'],
+    },
     'tract_voxels': {
         'file_format_category': 'table',
         'resource_type': 'results',
@@ -177,7 +183,7 @@ CHANNELS_ASSETS_TYPES_CONFIG = {
         'file_format_category': 'graph',
         'resource_type': 'graphs',
         'relevant_pipelines': ['TubeMap', 'AxonMap'],
-        'sub_types': ['raw', 'cleaned', 'reduced', 'annotated']
+        'sub_types': ['raw', 'cleaned', 'reduced', 'annotated', 'updated']
     },
 }
 

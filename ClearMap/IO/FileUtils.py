@@ -224,7 +224,7 @@ def delete_file(filename):
 
     Arguments
     ---------
-    filename : str
+    filename : str | Path
         Filename to delete.
     """
     if isinstance(filename, Path):
@@ -238,7 +238,7 @@ def copy_file(source, sink):
 
     Arguments
     ---------
-    source : str
+    source : str | pathlib.Path
         Filename of the file to copy.
     sink : str
         File or directory name to copy the file to.
@@ -253,6 +253,39 @@ def copy_file(source, sink):
         sink = os.path.join(sink, name)
     shutil.copy(source, sink)
     return sink
+
+
+def link_file(source, sink):
+    """Create a symbolic link to a file.
+
+    Arguments
+    ---------
+    source : str
+        Filename of the file to link.
+    sink : str
+        File or directory name to create the link at.
+
+    Returns
+    -------
+    sink : str
+        The name of the created link.
+    """
+    if is_directory(sink):
+        path, name = os.path.split(source)
+        sink = os.path.join(sink, name)
+    os.symlink(source, sink)
+    return sink
+
+
+def atomic_replace(tmp: Path, dst: Path) -> None:
+    """
+    Atomically replace dst with tmp.
+    tmp must already exist on the same filesystem as dst.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("rb") as f:   # open read-only
+        os.fsync(f.fileno())
+    os.replace(tmp, dst)
 
 
 def uncompress(file_path, extension='zip', check=True, verbose=False):
@@ -344,6 +377,7 @@ def compress(file_path, extension='zip', check=True, verbose=False):
         The compressed filename or None if failed.
     """
     file_path = Path(file_path)
+    compressed_path = None
     if file_path.exists() and check:
         if extension == 'auto':
             extension = 'zip'
@@ -473,7 +507,7 @@ def is_clearmap_source_extension(extension):
 
 def test():
     import ClearMap.IO.FileUtils as fu
-    reload(fu)
+    importlib.reload(fu)
 
     filename = fu.__file__
     path, name = fu.os.path.split(filename)

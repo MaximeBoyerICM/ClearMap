@@ -13,6 +13,8 @@ Note
 ----
 This viewer is based on the pyqtgraph package.
 """
+from __future__ import annotations
+
 __author__ = 'Christoph Kirst <christoph.kirst.ck@gmail.com>, Charly Rousseau <charly.rousseau@icm-institute.org>'
 __license__ = 'GPLv3 - GNU General Public License v3 (see LICENSE)'
 __copyright__ = 'Copyright © 2020 by Christoph Kirst'
@@ -21,18 +23,18 @@ __download__ = 'https://github.com/ClearAnatomics/ClearMap'
 
 import time
 import functools as ft
+from datetime import datetime
 
 import numpy as np
 
 import pyqtgraph as pg
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import QEvent, QRect, QSize, pyqtSignal, Qt
-from PyQt5.QtGui import QPainter
-from PyQt5.QtWidgets import QWidget, QRadioButton, QLabel, QSplitter, QApplication, QSizePolicy, QPushButton, QCheckBox, \
-  QGraphicsPathItem, QGridLayout, QLineEdit, QScrollArea
+from PyQt5.QtGui import QPainter, QIcon
+from PyQt5.QtWidgets import (QWidget, QRadioButton, QLabel, QSplitter, QApplication, QSizePolicy, QPushButton,
+                             QCheckBox, QGraphicsPathItem, QGridLayout, QLineEdit, QScrollArea, QFileDialog, QSpinBox)
 
 from ClearMap.Utils.utilities import runs_on_spyder
-from ClearMap.Utils.array_utils import dtype_range
 from ClearMap.IO.IO import as_source
 from ClearMap.IO.Source import Source
 from ClearMap.Visualization.Qt.data_viewer_luts import LUT, HighLowLUT
@@ -198,13 +200,14 @@ class DataViewer(QWidget):
 
         self.sliceLine.sigPositionChanged.connect(self.updateSlice)
 
-        # Axis tools
+        # Axis tools  # FIXME: extract and make addWidget widget location incremental not absolute
         self.axis_buttons = []
         axis_tools_layout, axis_tools_widget = self.__setup_axes_controls()
 
         # max projection depth
         self.max_projection = max_projection
         self.max_projection_edit = QLineEdit()
+        self.max_projection_edit.setPlaceholderText('max projection')
         if self.max_projection is not None:
             self.max_projection_edit.setText('%d' % self.max_projection)
         # self.max_projection_edit.setValidator(pg.QtGui.QIntValidator())
@@ -216,12 +219,14 @@ class DataViewer(QWidget):
 
         # points color
         self.points_color_button = pg.ColorButton(color=self.points_style.get('brush'))
+        self.points_color_button.setVisible(False)
         self.points_color_button.setMaximumWidth(30)
         self.points_color_button.sigColorChanged.connect(self.change_points_color)
         axis_tools_layout.addWidget(self.points_color_button, 0, 4)
 
         # vectors color and threshold
         self.vectors_color_button = pg.ColorButton(color=self.vectors_style.get('brush'))
+        self.vectors_color_button.setVisible(False)
         self.vectors_color_button.setMaximumWidth(30)
         self.vectors_color_button.sigColorChanged.connect(self.change_vectors_color)
         axis_tools_layout.addWidget(self.vectors_color_button, 0, 5)
@@ -230,6 +235,7 @@ class DataViewer(QWidget):
         vectors_threshold = self.vectors_style.get('threshold', None)
         if vectors_threshold is not None:
             self.vectors_threshold_edit.setText('%.4f' % vectors_threshold)
+        self.vectors_threshold_edit.setVisible(False)
         self.vectors_threshold_edit.setMaxLength(6)
         self.vectors_threshold_edit.setAlignment(Qt.AlignRight)
         self.vectors_threshold_edit.setMaximumWidth(60)
@@ -238,11 +244,13 @@ class DataViewer(QWidget):
 
         # orientation threshold
         self.orientations_color_button = pg.ColorButton(color=self.orientations_style.get('pen'))
+        self.orientations_color_button.setVisible(False)
         self.orientations_color_button.setMaximumWidth(30)
         self.orientations_color_button.sigColorChanged.connect(self.change_orientations_color)
         axis_tools_layout.addWidget(self.orientations_color_button, 0, 7)
 
         self.orientations_threshold_edit = QLineEdit()
+        self.orientations_threshold_edit.setVisible(False)
         orientations_threshold = self.orientations_style.get('threshold', None)
         if orientations_threshold is not None:
             self.orientations_threshold_edit.setText('%.4f' % orientations_threshold)
@@ -263,6 +271,35 @@ class DataViewer(QWidget):
         self.source_label_scroll.setWidget(self.source_label)
 
         axis_tools_layout.addWidget(self.source_label_scroll, 0, 9)
+
+        self.screenshot_btn = QPushButton('📸')
+        icon = QIcon.fromTheme('camera-photo')
+        if not icon.isNull():
+            self.screenshot_btn.setIcon(icon)
+            self.screenshot_btn.setIconSize(QSize(20, 20))
+
+        self.screenshot_btn.setToolTip('Save screenshot')
+        self.screenshot_btn.setMaximumWidth(34)
+        self.screenshot_btn.clicked.connect(self.save_screenshot)
+        axis_tools_layout.addWidget(self.screenshot_btn, 1, 2)
+
+
+        # Controls for marker size
+        # FIXME: Invisible if no markers
+        self.marker_size_spin = QSpinBox()
+        self.marker_size_spin.setRange(1, 100)
+        self.marker_size_spin.setValue(10)
+        self.marker_size_spin.setPrefix("Marker: ")
+        self.marker_size_spin.valueChanged.connect(lambda: self.updateSlice(force_update=True))
+        axis_tools_layout.addWidget(self.marker_size_spin, 1, 3)
+
+        self.marker_scale_with_zoom = QCheckBox("Scale w/ zoom")
+        self.marker_scale_with_zoom.setChecked(False)
+        self.marker_scale_with_zoom.stateChanged.connect(lambda: self.updateSlice(force_update=True))
+        axis_tools_layout.addWidget(self.marker_scale_with_zoom, 1, 4)
+
+        self.marker_size_spin.setVisible(self.scatter is not None)
+        self.marker_scale_with_zoom.setVisible(self.scatter is not None)
 
         self.graphicsView.scene().sigMouseMoved.connect(self.updateLabelFromMouseMove)
 
@@ -641,22 +678,39 @@ class DataViewer(QWidget):
             index = min(max(0, int(self.sliceLine.value())), self.source_shape[ax] - 1)
             self.plot_scatter_markers(ax, index)
 
+    def _scale_markers(self):
+        base_size = self.marker_size_spin.value()
+        if self.marker_scale_with_zoom.isChecked():
+            x_range, y_range = self.view.viewRange()
+            scale_x = self.source_range_x / (x_range[1] - x_range[0])
+            scale_y = self.source_range_y / (y_range[1] - y_range[0])
+            zoom_factor = (scale_x + scale_y) / 2.0
+            scaled_size = round(base_size * zoom_factor)
+        else:
+            scaled_size = base_size
+            zoom_factor = 1.0  # for the surrounding-slice path
+
+        return scaled_size, zoom_factor
+
 
     def plot_scatter_markers(self, ax, index):
         if self.scatter_coords is None:
             return
+        self.marker_size_spin.setVisible(self.scatter is not None)
+        self.marker_scale_with_zoom.setVisible(self.scatter is not None)
         self.scatter.clear()
         self.scatter_coords.axis = ax
-        pos = self.scatter_coords.get_pos(index)
-        x_range, y_range = self.view.viewRange()
+
+        # x_range, y_range = self.view.viewRange()
         # Compute scale from the ratio between original and current view range
+        # scale_x = self.source_range_x / (x_range[1] - x_range[0])
+        # scale_y = self.source_range_y / (y_range[1] - y_range[0])
+        # zoom_factor = (scale_x + scale_y) / 2.0
+        #
+        # scaled_size = round(self.scatter_coords.marker_size * zoom_factor)
 
-        scale_x = self.source_range_x / (x_range[1] - x_range[0])
-        scale_y = self.source_range_y / (y_range[1] - y_range[0])
-        zoom_factor = (scale_x + scale_y) / 2.0
-
-        scaled_size = round(self.scatter_coords.marker_size * zoom_factor)
-
+        scaled_size, zoom_factor = self._scale_markers()
+        pos = self.scatter_coords.get_pos(index)
         if all(pos.shape):
             if self.scatter_coords.has_colours:
                 self.scatter.setData(pos=pos,
@@ -700,6 +754,7 @@ class DataViewer(QWidget):
             self.points = as_source(points)
         self.initialize_points_item()
         self.update_points()
+        self.points_color_button.setVisible(True)
 
     def update_points(self):
         if self.points is not None:
@@ -734,6 +789,8 @@ class DataViewer(QWidget):
     def set_vectors(self, vectors):
         self.vectors = vectors
         self.update_vectors()
+        self.vectors_color_button.setVisible(True)
+        self.vectors_threshold_edit.setVisible(True)
 
     def update_vectors(self):
         if self.vectors is not None:
@@ -794,6 +851,8 @@ class DataViewer(QWidget):
     def set_orientations(self, orientations):
         self.orientations = orientations
         self.update_orientations()
+        self.orientations_color_button.setVisible(True)
+        self.orientations_threshold_edit.setVisible(True)
 
     def update_orientations(self):
         if self.orientations is not None:
@@ -869,6 +928,36 @@ class DataViewer(QWidget):
     def padded_shape(self, shape):
         pad_size = max(3, len(shape))
         return (shape + (1,) * pad_size)[:pad_size]
+
+    def save_screenshot(self, *_):
+        """
+        Save a PNG/JPEG/TIFF screenshot of the current viewer.
+        By default, captures just the central image area (graphicsView).
+        Switch to `self.grab()` below if you want the whole window (incl. LUTs).
+        """
+        # Grab the rendered view (image + overlays)
+        # TODO: full/image_only combobox to select between self.graphicsView.grab() and self.grab() for full window
+        pixmap = self.graphicsView.grab()
+
+        # Build a friendly default name with title, slice index, timestamp
+        try:
+            title = self.windowTitle() or "DataViewer"
+        except Exception:
+            title = "DataViewer"
+        for forbidden_char in ['<', '>', ':', '"', '/', '\\', '|', '?', '*', ' ']:
+            title = title.replace(forbidden_char, "_")
+        z = str(int(self.source_index[self.scroll_axis])).zfill(4)
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suggested = f"{title}_z{z}_{now}.png"
+
+        dest_path, _ = QFileDialog.getSaveFileName(self, 'Save screenshot', suggested,
+                                                   'PNG (*.png);;JPEG (*.jpg *.jpeg);;TIFF (*.tif *.tiff)')
+        if not dest_path:
+            return
+
+        ok = pixmap.save(dest_path)
+        if not ok:
+            pixmap.save(dest_path, 'PNG')
 
     # def __cast_bools(self):
     #     for i, s in enumerate(self.sources):

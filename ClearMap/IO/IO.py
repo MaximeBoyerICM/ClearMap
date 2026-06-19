@@ -61,7 +61,7 @@ from ClearMap.Utils.utilities import CancelableProcessPoolExecutor
 # FIXME:
 from ClearMap.IO.FileUtils import (is_file, is_directory, file_extension,   # analysis:ignore
                                    join, split, abspath, create_directory, 
-                                   delete_directory, copy_file, delete_file)
+                                   delete_directory, copy_file, link_file, delete_file)
 
 ###############################################################################
 # ## Source associations
@@ -80,7 +80,13 @@ file_extension_to_module = {'npy': mmp,
 if gt_loaded:
     file_extension_to_module['gt'] = gt
     source_modules += [gt]
-"""Map between file extensions and modules that handle this file type."""        
+"""Map between file extensions and modules that handle this file type."""
+
+
+class AssetBase:
+    @property
+    def path(self):
+        raise NotImplementedError('AssetBase is an abstract class, cannot get path!')
 
 
 ###############################################################################
@@ -100,6 +106,8 @@ def source_to_module(source_):
     type : module
         The module that handles the IO of the source.
     """
+    if isinstance(source_, AssetBase):
+        source_ = source_.path
     if isinstance(source_, pathlib.Path):
         source_ = str(source_)
 
@@ -161,7 +169,7 @@ def filename_to_module(filename):
 
     mod = file_extension_to_module.get(ext, None)
     if mod is None:
-        raise SourceModuleNotFoundError(f"Cannot determine module for file {filename} with extension {ext}!")
+        raise SourceModuleNotFoundError(filename, ext)
 
     return mod
 
@@ -819,7 +827,7 @@ def convert_files(filenames, extension=None, path=None, processes=None, verbose=
 
     Arguments
     ---------
-    filenames : list of str
+    filenames : list of str | list of pathlib.Path
         The filenames to convert
     extension : str
         The new file format extension.

@@ -6,14 +6,20 @@ GraphGt
 Module provides basic Graph interface to the
 `graph_tool <https://graph-tool.skewed.de>`_ library.
 """
+from __future__ import annotations
+
 __author__ = 'Christoph Kirst <christoph.kirst.ck@gmail.com>'
 __license__ = 'GPLv3 - GNU General Public License v3 (see LICENSE)'
 __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__ = 'https://idisco.info'
 __download__ = 'https://www.github.com/ChristophKirst/ClearMap2'
 
+
 import copy
 import numbers
+import pathlib
+from typing import Optional, Iterable, Dict
+from pathlib import Path
 
 import numpy as np
 
@@ -21,13 +27,14 @@ import graph_tool as gt
 import graph_tool.util as gtu
 import graph_tool.topology as gtt
 import graph_tool.generation as gtg
+import warnings
 
 # fix graph tool saving / loading for very large arrays
 import ClearMap.Analysis.graphs.graph as grp
 from ClearMap.Analysis.graphs.type_conversions import dtype_to_gtype, gtype_from_source, vertex_property_map_to_python, \
   edge_property_map_to_python, vertex_property_map_from_python, set_vertex_property_map, edge_property_map_from_python, \
   set_edge_property_map
-from ClearMap.Analysis.graphs.utils import pickler, unpickler, edges_to_vertices
+from ClearMap.Analysis.graphs.utils import pickler, unpickler, edges_to_vertices, scan_gt_props
 
 from ClearMap.Utils.array_utils import remap_array_ranges
 
@@ -46,6 +53,7 @@ class Graph(grp.AnnotatedGraph):
     This is an interface from ClearMap graphs to graph_tool.
     """
     DEFAULT_N_DIMS = 3
+    SCOPES = ("vertex", "edge", "graph")
 
     def __init__(self, name=None, n_vertices=None, edges=None, directed=None,
                  vertex_coordinates=None, vertex_radii=None,
@@ -163,6 +171,9 @@ class Graph(grp.AnnotatedGraph):
 
     def vertex_property_map(self, name):
         return self._base.vertex_properties[name]
+
+    def has_vertex_property(self, prop_name: str):
+        return prop_name in self.vertex_properties
 
     @property
     def vertex_properties(self):
@@ -297,6 +308,9 @@ class Graph(grp.AnnotatedGraph):
     def edge_properties(self):
         return self._base.edge_properties.keys()
 
+    def has_edge_property(self, prop_name: str):
+        return prop_name in self.edge_properties
+
     def add_edge_property(self, name, source=None, dtype=None):
         p = edge_property_map_from_python(source, self)
         self._base.edge_properties[name] = p
@@ -354,6 +368,9 @@ class Graph(grp.AnnotatedGraph):
     @property
     def graph_properties(self):
         return self._base.graph_properties.keys()
+
+    def has_graph_property(self, prop_name: str):
+        return prop_name in self.graph_properties
 
     def add_graph_property(self, name, source, dtype=None):
         if dtype is None:
@@ -446,8 +463,48 @@ class Graph(grp.AnnotatedGraph):
     def has_vertex_radii(self):
         return 'radii' in self.vertex_properties
 
-    def vertex_radii(self, vertex=None):
+    def vertex_radii_voxels(self, vertex=None) -> np.ndarray:
+        """
+        Vertex radii in **voxels**.
+
+        Raises
+        ------
+        KeyError
+            If radii have not been measured yet.  Call _measure_radii() first.
+            For physical units use :meth:`vertex_radii_units`.
+        """
+        if 'radii' not in self.vertex_properties:
+            raise KeyError("'radii' (voxel) property not found. "
+                           "Ensure graph_processing._measure_radii() was called before accessing vertex_radii_voxels(). "
+                           "For physical units use vertex_radii_units().")
         return self.vertex_property('radii', vertex=vertex)
+
+    def vertex_radii_units(self, vertex=None) -> np.ndarray:
+        """
+        Vertex radii in **physical units** (µm).
+
+        Raises
+        ------
+        KeyError
+            If radius_units have not been measured yet.  Call _measure_radii()
+            with a valid spacing array first.
+            For voxel units use :meth:`vertex_radii_voxels`.
+        """
+        if 'radius_units' not in self.vertex_properties:
+            raise KeyError("'radius_units' (µm) property not found. "
+                           "Ensure graph_processing._measure_radii() was called with "
+                           "a valid spacing array before accessing vertex_radii_units().")
+        return self.vertex_property('radius_units', vertex=vertex)
+
+    def vertex_radii(self, vertex=None) -> np.ndarray:
+        """
+        .. deprecated::
+            Use :meth:`vertex_radii_voxels` or :meth:`vertex_radii_units` explicitly.
+            This method returns voxel radii and will be removed in a future version.
+        """
+        warnings.warn("vertex_radii() is ambiguous and deprecated. Use vertex_radii_voxels() for voxel units "
+                      "or vertex_radii_units() for physical units (µm).", DeprecationWarning, stacklevel=2)
+        return self.vertex_radii_voxels(vertex=vertex)
 
     def set_vertex_radii(self, radii, vertex=None):
         self.define_vertex_property('radii', radii, vertex=vertex)
@@ -469,8 +526,51 @@ class Graph(grp.AnnotatedGraph):
     def has_edge_radii(self):
         return 'radii' in self.edge_properties
 
-    def edge_radii(self, edge=None):
+    @property
+    def has_edge_radii_um(self) -> bool:
+        """True if µm radii have been propagated to edges."""
+        return 'radius_units' in self.edge_properties
+
+    def edge_radii_voxels(self, edge=None) -> np.ndarray:
+        """
+        Edge radii in **voxels** (aggregated from vertex radii during reduce_graph).
+
+        Raises
+        ------
+        KeyError
+            If radii have not been propagated to edges yet.
+        """
+        if 'radii' not in self.edge_properties:
+            raise KeyError(
+                "'radii' (voxel) edge property not found. "
+                "Ensure reduce_graph() ran with 'radii' in vertex_to_edge_mappings.")
         return self.edge_property('radii', edge=edge)
+
+    def edge_radii_um(self, edge=None) -> np.ndarray:
+        """
+        Edge radii in **physical units** (µm).
+
+        Raises
+        ------
+        KeyError
+            If radius_units have not been propagated to edges yet.
+        """
+        if 'radius_units' not in self.edge_properties:
+            raise KeyError(
+                "'radius_units' (µm) edge property not found. "
+                "Ensure reduce_graph() ran with 'radius_units' in vertex_to_edge_mappings.")
+        return self.edge_property('radius_units', edge=edge)
+
+    def edge_radii(self, edge=None) -> np.ndarray:
+        """
+        .. deprecated::
+            Use :meth:`edge_radii_voxels` or :meth:`edge_radii_um` explicitly.
+        """
+        import warnings
+        warnings.warn(
+            "edge_radii() is ambiguous and deprecated. Use edge_radii_voxels() or edge_radii_um().",
+            DeprecationWarning, stacklevel=2)
+        return self.edge_radii_voxels(edge=edge)
 
     def set_edge_radii(self, radii, edge=None):
         self.define_edge_property('radii', radii, edge=edge)
@@ -785,7 +885,7 @@ class Graph(grp.AnnotatedGraph):
         """
         for v_prop_name in edge_geometry_vertex_properties:
             if v_prop_name in original_graph.vertex_properties:
-                # If already exists
+                # If already exists, skip
                 if self.edge_geometry_property_name(v_prop_name) in self.edge_geometry_property_names:
                     continue  # Skip if already set, it will be handled by the edge aggregation
                 v_prop = original_graph.vertex_property(v_prop_name)[branch_indices]
@@ -924,6 +1024,33 @@ class Graph(grp.AnnotatedGraph):
 
     # ## Functionality
     def sub_graph(self, vertex_filter=None, edge_filter=None, view=False):
+        """
+        Construct a subgraph using graph-tool filtering, returning either a view or a pruned copy.
+
+        Parameters
+        ----------
+        vertex_filter: None | array-like | gt.PropertyMap
+            Vertex selection mask or property map. Commonly a 1-D boolean numpy array of length
+            `self.n_vertices`. True means “vertex is retained in the view”.
+        edge_filter: None | array-like | gt.PropertyMap
+            Edge selection mask or property map. Commonly a 1-D boolean numpy array of length
+            `self.n_edges`. True means “edge is retained in the view”.
+        view: bool
+            - If True: return a `Graph` wrapping a `gt.GraphView` (no pruning/copy).
+            - If False: materialize a pruned copy via `gt.Graph(gv, prune=True)`.
+
+        Returns
+        -------
+        Graph
+            A graph restricted by the provided filters.
+
+        Notes
+        -----
+        Edge geometry handling:
+        - If the resulting graph has edges and the source graph has edge geometry, `prune_edge_geometry()`
+          is called to compact edge-geometry arrays to the retained edge set.
+        - If the resulting graph has no edges, edge geometry is removed (`remove_edge_geometry()`).
+        """
         gv = gt.GraphView(self.base, vfilt=vertex_filter, efilt=edge_filter)
         if view:
             return Graph(base=gv)
@@ -1092,9 +1219,74 @@ class Graph(grp.AnnotatedGraph):
         return label
 
     # ## Geometric manipulation
-    def sub_slice(self, slicing, view=False, coordinates=None):
+    def sub_slice(self, slicing, view=False, coordinates=None, cut_edges='exclusive'):
+        """
+        Slice the graph by an axis-aligned spatial selection, with optional boundary-edge policy.
+
+        The slice is defined by applying `slicing` to per-vertex coordinates (by default the
+        'coordinates' vertex property). This produces an initial vertex mask `V0`.
+
+        Two boundary policies are supported via `cut_edges`:
+
+        - cut_edges='exclusive' (default; current behaviour):
+          Return the induced subgraph on V0 (i.e. retain an edge only if both endpoints are in V0).
+          Implementation: `sub_graph(vertex_filter=V0, ...)`.
+
+        - cut_edges='inclusive':
+          Retain an edge if at least one of its endpoints is in V0, based on `edge_connectivity()`.
+          Additionally expand the retained vertex set to include both endpoints of every retained edge.
+          Implementation:
+            * E_keep = (V0[src] | V0[dst])
+            * V_keep = V0 ∪ endpoints(E_keep)
+            * `sub_graph(vertex_filter=V_keep, edge_filter=E_keep, ...)`
+
+        Parameters
+        ----------
+        slicing:
+            A slicing spec accepted by `ClearMap.IO.IO.slc.unpack_slicing` (slices/ints per axis).
+        view: bool
+            If True, return a lightweight `gt.GraphView`-backed Graph wrapper.
+            If False, return a pruned copy (see `sub_graph`).
+        coordinates: None | str | np.ndarray
+            Coordinate source to slice against:
+            - None: uses `self.vertex_coordinates()`
+            - str: name of a vertex property to use
+            - np.ndarray: explicit (N, ndim) coordinates array
+        cut_edges: str
+            Boundary edge policy. One of: 'exclusive', 'inclusive'.
+
+        Returns
+        -------
+        Graph
+            The sliced graph (view or pruned copy). If edge geometry exists and edges are retained,
+            geometry is compacted via `prune_edge_geometry()` in `sub_graph`.
+        """
         valid = self.sub_slice_vertex_filter(slicing, coordinates=coordinates)
-        return self.sub_graph(vertex_filter=valid, view=view)
+
+        match cut_edges:
+            case 'exclusive':
+                return self.sub_graph(vertex_filter=valid, view=view)
+            case 'inclusive':
+                ec = self.edge_connectivity(order='eid')
+                src = ec[:, 0]
+                dst = ec[:, 1]
+                e_keep = valid[src] | valid[dst]
+
+                # Expand vertex set: if an edge is kept, keep both its endpoints.
+                v_keep = valid.copy()
+                if e_keep.any():
+                    v_keep[np.unique(ec[e_keep].reshape(-1))] = True
+
+                subg1 = self.sub_graph(vertex_filter=v_keep, edge_filter=e_keep, view=view)
+                valid2 = subg1.sub_slice_vertex_filter(slicing, coordinates=coordinates)
+                ec = subg1.edge_connectivity(order='eid')
+                src = ec[:, 0]
+                dst = ec[:, 1]
+                e_keep2 = valid2[src] | valid2[dst]
+
+                return subg1.sub_graph(edge_filter=e_keep2)
+            case _:
+                raise ValueError(f'cut_edges must be one of: "exclusive", "inclusive"; got {cut_edges!r}')
 
     def _slice_coordinates(self, coordinates, slicing, size):
         import ClearMap.IO.IO as io
@@ -1200,12 +1392,49 @@ class Graph(grp.AnnotatedGraph):
         print(self.__str__())
         self._base.list_properties()
 
-    def save(self, filename):
+    def save(self, filename: str | Path):
         self._base.save(str(filename))
 
-    def load(self, filename):
-        self.path = str(filename)
-        self._base = gt.load_graph(self.path)
+    def export_vertex_properties(self, output_path: str | Path, v_props: list[str] | None = None):
+        """
+        Export vertex properties as a pandas DataFrame.
+        The export format will be determined by the file extension.
+
+        Parameters
+        ----------
+        v_props: list of str
+            The vertex properties to export.
+        output_path: str | Path
+            The output file path.
+        """
+        output_path = str(output_path)
+        if v_props is None:
+            v_props = list(self._base.vertex_properties)
+
+        data = {'vertex_id': self.vertex_indices()}
+        for prop_name in  v_props:
+            prop_array = self.vertex_property(prop_name)
+            if prop_array.ndim == 1:  # Scalar property
+                data[prop_name] = prop_array
+            else:  # Vector property
+                if 'coordinates' in prop_name:  # We know how to name these
+                    coord_type = prop_name.replace('coordinates', '').strip('_')
+                    coord_prefix = coord_type + "_" if coord_type else ""
+                    for i, axis in enumerate('xyz'):
+                        data[f'{coord_prefix}{axis}'] = prop_array[:, i]
+                else:  # Generic names
+                    for i in range(prop_array.shape[1]):
+                        data[f'{prop_name}_dim{i}'] = prop_array[:, i]
+
+        import pandas as pd
+        df = pd.DataFrame(data)
+        extension = Path(output_path).suffix
+        if extension == '.csv':
+            df.to_csv(output_path, index=False)
+        elif extension in ('.feather', '.fthr'):
+            df.to_feather(output_path)
+        else:
+            raise NotImplementedError(f'Export format {Path(output_path).suffix} is not yet supported!')
 
     def copy(self, from_disk=False, path=''):
         if from_disk:
@@ -1241,12 +1470,94 @@ class Graph(grp.AnnotatedGraph):
                     new_base.ep[name] = q
                 return Graph(name=copy.copy(self.name), base=new_base)
 
+    @staticmethod
+    def scan_gt_properties(filename: str, as_dict: bool = False):
+        """
+        Scan the graph-tool file for its properties without loading the entire graph.
+        filename : str
+            The path to the graph-tool file.
+        as_dict : bool
+            If True, return a dictionary of property names. If False, return a list of tuples (scope, name, dtype).
+        """
+
+        props = scan_gt_props(filename)
+        if as_dict:
+            out = {
+                "vertex": [name for scope, name, _ in props if scope == 'vertex'],
+                "edge": [name for scope, name, _ in props if scope == 'edge'],
+                "graph": [name for scope, name, _ in props if scope == 'graph'],
+            }
+            return out
+        return props
+
+    @classmethod
+    def load(cls, filename, ignore_vp=None, ignore_ep=None, ignore_gp=None):
+        g = gt.load_graph(str(filename), ignore_vp=ignore_vp, ignore_ep=ignore_ep, ignore_gp=ignore_gp)
+        graph = cls(base=g)
+        graph.path = str(filename)
+        return graph
+    
+    @classmethod
+    def partial_load(cls, filename: str, *, exclude_edge_geometry_properties: bool = False,
+                     include_dict: Optional[Dict[str, Iterable[str]]] = None,
+                     exclude_dict: Optional[Dict[str, Iterable[str]]] = None,
+                     include: Optional[Iterable[str]] = None, exclude: Optional[Iterable[str]] = None):
+        """
+        Partially load a graph from a file, allowing for inclusion and exclusion of specific properties.
+
+        Five options are available, in order of precedence:
+            1. exclude_geometry_properties: If True, all edge geometry properties (those starting with 'edge_geometry_') are excluded.
+            2. include_dict: A dictionary specifying which properties to include for each scope ('vertex', 'edge', 'graph').
+            3. exclude_dict: A dictionary specifying which properties to exclude for each scope ('vertex', 'edge', 'graph').
+            4. include: A list of property names to include across all scopes.
+            5. exclude: A list of property names to exclude across all scopes.
+        
+        Note: To know which properties are available in the file, use Graph.scan_gt_properties(filename, as_dict=True).
+        """
+        props = cls.scan_gt_properties(filename, as_dict=True)
+        props_sets = {s: set(props.get(s, ())) for s in cls.SCOPES}
+
+        def _as_scope_map(x):
+            """
+            Normalize iterable-or-dict into {scope: set(...)}. Makes
+            it easy to broadcast to all include/exclude options, whether supplied
+            as dict or iterable.
+            - dict: per-scope values
+            - iterable: applies to all scopes
+            - strings are treated as a single value, not an iterable of chars
+            """
+            if isinstance(x, dict):
+                return {scope: set(x.get(scope, ())) for scope in cls.SCOPES}
+            if isinstance(x, str):  # Because strings are iterable
+                return {scope: {x} for scope in cls.SCOPES}
+            return {scope: set(x) for scope in cls.SCOPES}
+
+        if exclude_edge_geometry_properties:
+            props["graph"] = [p for p in props["graph"] if p.startswith('edge_geometry_')]
+            return cls.load(filename, ignore_gp=props["graph"])
+        elif include_dict:
+            allow = _as_scope_map(include_dict)
+            ignore = {s: props_sets[s] - allow[s] for s in cls.SCOPES}
+        elif exclude_dict:
+            block = _as_scope_map(exclude_dict)
+            ignore = {s: props_sets[s] & block[s] for s in cls.SCOPES}
+        elif include:
+            allow = _as_scope_map(include)
+            ignore = {s: props_sets[s] - allow[s] for s in cls.SCOPES}
+        elif exclude:
+            block = _as_scope_map(exclude)
+            ignore = {s: props_sets[s] & block[s] for s in cls.SCOPES}
+        else:
+            return cls.load(filename)
+
+        ignore = {scope: list(v) for scope, v in ignore.items()}
+
+        return cls.load(filename, ignore_vp=ignore['vertex'], ignore_ep=ignore['edge'], ignore_gp=ignore['graph'])
+
 
 def load(filename):
-    g = gt.load_graph(str(filename))
-    graph = Graph(base=g)
-    graph.path = str(filename)
-    return graph
+    warnings.warn("Use Graph.load() instead of load()", DeprecationWarning)
+    return Graph.load(filename)
 
 
 def save(filename, graph):

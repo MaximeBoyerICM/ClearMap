@@ -163,13 +163,14 @@ default_postprocessing_parameter = dict(
 See :func:`postprocess` for details."""
 
 default_postprocessing_processing_parameter = dict(
+    overlap=None,
     size_min=None,
     optimization=True,
     optimization_fix='all',
     as_memory=True
 )
 """Parallel processing parameter for the vasculature postprocessing pipeline. 
-See :func:`ClearMap.ParallelProcessing.BlockProcessing.process`. for details."""
+See :func:`ClearMap.ParallelProcessing.BlockProcessing.process`. for details."""     
 
 
 ###############################################################################
@@ -821,27 +822,23 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
 
     gc.collect()
 
-
 def apply_smoothing(source, sink, parameter_smooth, processing_parameter, processes=None, verbose=True):
-
-    source_size = np.prod(source.shape) * source.dtype.itemsize
-
-    if parameter_smooth.get('iterations', 1) > 1:  # Try to save to temp to ensure locality if >1 iter
-        if get_free_temp_space() > source_size:
-            tmp_f_path = tempfile.mktemp(prefix='TubeMap_vasc_smooth_', suffix='.npy')
-        else:  # Default to experiment directory
-            warnings.warn(f'Free space in temporary directory is insufficient, '
-                          f'required {bytes_to_human(source_size)}, '
-                          f'got {bytes_to_human(get_free_temp_space())} '
-                          f'defaulting to experiment directory')
-            tmp_f_path = Path(source.location).parent / f'TubeMap_vasc_smooth_{source.name}.npy'
-        sink = ap.initialize_sink(tmp_f_path, shape=source.shape, dtype=source.dtype,
-                                  order=source.order, return_buffer=False)
+    """
+    When iterations > 1 the intermediate file is written as a sibling of
+    the source in the experiment directory.
+    The caller owns the returned path and decides whether to delete it via
+    BinaryVesselProcessorSteps.consume_and_cleanup().
+    """
+    if parameter_smooth.get('iterations', 1) > 1:
+        source_path = Path(source.location)
+        tmp_f_path = str(source_path.parent / f'{source_path.stem}_smooth_tmp.npy')
+        tmp_sink = ap.initialize_sink(tmp_f_path, shape=source.shape, dtype=source.dtype,
+                                      order=source.order, return_buffer=False)
     else:
         tmp_f_path = ''
+        tmp_sink = sink
 
-    # run smoothing
-    smoothed = bs.smooth_by_configuration(source, sink=sink, processing_parameter=processing_parameter,
+    smoothed = bs.smooth_by_configuration(source, sink=tmp_sink, processing_parameter=processing_parameter,
                                           processes=processes, verbose=verbose, **parameter_smooth)
     return smoothed, tmp_f_path
 
@@ -958,6 +955,7 @@ def equalize(source, percentile=(0.5, 0.95), max_value=1.5, selem=(200, 200, 5),
 
 def tubify(source, sigma=1.0, gamma12=1.0, gamma23=1.0, alpha=0.25):
     return hes.lambda123(source=source, sink=None, sigma=sigma, gamma12=gamma12, gamma23=gamma23, alpha=alpha)
+
 
 ###############################################################################
 # ## Helper
