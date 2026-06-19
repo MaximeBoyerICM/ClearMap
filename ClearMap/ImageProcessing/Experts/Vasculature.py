@@ -140,10 +140,10 @@ default_binarization_parameter = dict(
 See :func:`binarize` for details."""
 
 default_binarization_processing_parameter = dict(
-    size_max=400,
-    size_min=250,
+    size_max=40,
+    size_min=10,
     overlap=5,
-    axes=[0,2],
+    axes=[2],
     optimization=True,
     optimization_fix='all',
     verbose=None,

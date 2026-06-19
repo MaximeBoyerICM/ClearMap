@@ -451,12 +451,20 @@ class BinaryVesselProcessor(PipelineOrchestrator):
 
         binarization_parameter = copy.deepcopy(vasculature.default_binarization_parameter)
         binarization_parameter['clip']['clip_range'] = binarization_cfg['binarize']['clip_range']
+        binarization_parameter['gamma']['gamma'] = binarization_cfg['binarize']['gamma']
         deconvolve_threshold = binarization_cfg['binarize']['threshold']
         if deconvolve_threshold is not None:
             binarization_parameter['deconvolve']['threshold'] = deconvolve_threshold
 
         if channel != self.all_vessels_channel:  # For arteries or veins
-            binarization_parameter.update(equalize=None, vesselize=None)
+            # binarization_parameter.update(equalize=None, vesselize=None)
+            binarization_parameter.update(lightsheet_correction=None,
+                                          gamma=None, snake=None,
+                                          equalize=None, vesselize=None)
+
+        else:
+            binarization_parameter.update(ligthsheet_correction=None, snake=None,
+                                          equalize=None, vesselize=None)
 
         processing_parameter = copy.deepcopy(vasculature.default_binarization_processing_parameter)
         channel_perf = self.config['performance']['binarization']['single_channels'][channel]
