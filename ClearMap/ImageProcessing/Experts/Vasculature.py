@@ -812,7 +812,7 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
         keep_smoothed = False
 
     if run_binary_filling:
-        bf.slice_filling(fill_source, sink, processes=processes, verbose=verbose)
+        bf.fill(fill_source, sink, processes=processes, verbose=verbose)
         # bf.fill(fill_source, sink=sink, processes=processes, verbose=verbose)
         if parameter_smooth and not keep_smoothed:  # FIXME: should be in a finaly block
             io.delete_file(tmp_f_path)

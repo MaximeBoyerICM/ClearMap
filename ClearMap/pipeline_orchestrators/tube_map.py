@@ -521,8 +521,9 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         sink = initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
 
         perf_cfg = self.config['performance']['binarization']['single_channels'][channel]['binary_fill']
-        binary_filling.fill(source, sink=sink, processes=sanitize_n_processes(perf_cfg['n_processes']),
-                            verbose=True)
+        double_pass = channel==self.all_vessels_channel
+        binary_filling.slice_fill(source, sink=sink, processes=sanitize_n_processes(perf_cfg['n_processes']),
+                                  verbose=True, step=4, fill_ratio=500, connectivity=1, double_pass=double_pass)
 
         self.steps[channel].consume_and_cleanup()
         keep = self.config['binarization']['single_channels'][channel]['binary_fill'].get('save', True)

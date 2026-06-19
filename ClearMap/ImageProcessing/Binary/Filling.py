@@ -141,34 +141,49 @@ def border_indices(source):
                 border.append(indices)
     return np.concatenate(border)
 
+import cc3d
 
-def fill_block(source, step, area_threshold, connectivity):
-    # OPTIMIZATION: Consider cc3d implementation to speed up
+def _slice_fill_block(array, step, fill_ratio, connectivity, area_threshold):
+    for axis in range(3):
+        # if axis == 2:
+        #     step = int(step // 1.5)  # TODO should depend on resolution. here 1.5 = 2.5 / 1.625
+        size = array.shape[axis]
+        slicer = [slice(None)] * array.ndim
+
+        if area_threshold is None:
+            slice_shape = list(array.shape)
+            slice_shape[axis] = step
+            slice_shape = sorted(slice_shape)
+            plane_size = slice_shape[-1] * slice_shape[-2]
+            axis_area_threshold = (step * plane_size) // fill_ratio  # TODO make parameter more explicit
+            print(array.shape, axis, slice_shape, axis_area_threshold)
+        else:
+            axis_area_threshold = area_threshold
+
+        for start in range(0, size, step):
+            slicer[axis] = slice(start, min(start + step, size))
+            slc = tuple(slicer)
+            cc3d.dust(
+                array[slc],
+                threshold=axis_area_threshold,
+                connectivity=connectivity,
+                in_place=True,
+                binary_image=True,
+            )
+
+
+def slice_fill_block(source, step, fill_ratio, connectivity, double_pass, area_threshold):
     try:
         filled = source.array if isinstance(source, io.src.Source) else source
+        cc3d_conn = {1: 6, 2: 18, 3: 26}.get(connectivity, 6)
 
-        np.logical_not(filled, out=filled)
+        filled = np.logical_not(filled)
 
-        for block_axis in range(3):
-            size = filled.shape[block_axis]
-            slicer = [slice(None)] * filled.ndim
+        if double_pass:
+            _slice_fill_block(filled, step=10, fill_ratio=100, area_threshold=None, connectivity=cc3d_conn)
+        _slice_fill_block(filled, step=step, fill_ratio=fill_ratio, area_threshold=area_threshold, connectivity=cc3d_conn)
 
-            if area_threshold is None:
-                slice_shape = list(filled.shape)
-                slice_shape[block_axis] = step
-                slice_shape = sorted(slice_shape)
-                plane_size = slice_shape[-1] * slice_shape[-2]
-                axis_area_threshold = plane_size // 8  # TODO find something else than 8?
-            else:
-                axis_area_threshold = area_threshold
-
-            for start in range(0, size, step):
-                slicer[block_axis] = slice(start, min(start + step, size))
-                slc = tuple(slicer)
-                filled[slc] = remove_small_objects(
-                    filled[slc], max_size=axis_area_threshold, connectivity=connectivity
-                )
-        np.logical_not(filled, out=filled)
+        filled = np.logical_not(filled)
         return filled
     except Exception as err:
         print(f"ERROR in fill")
@@ -176,8 +191,16 @@ def fill_block(source, step, area_threshold, connectivity):
         raise
 
 
-def slice_filling(source, sink=None, step=4, area_threshold=None, connectivity=2, processing_parameter=None,
-                    processes=None, verbose=False):
+def slice_fill(source,
+               sink=None,
+               step=None,
+               fill_ratio=None,
+               connectivity=None,
+               double_pass=None,
+               area_threshold=None,
+               processing_parameter=None,
+               processes=None,
+               verbose=False):
     if verbose:
         print('Binary slice filling: initialization...')
         timer = tmr.Timer()
@@ -194,12 +217,18 @@ def slice_filling(source, sink=None, step=4, area_threshold=None, connectivity=2
     if processing_parameter is not None:
         block_processing_parameter.update(processing_parameter)
     if block_processing_parameter.get('overlap') is None:
-        block_processing_parameter.update({'overlap': 0})
+        block_processing_parameter.update({'overlap': 30})
     if block_processing_parameter.get('size_min') is None:
         block_processing_parameter.update(size_min=step * 10)
-    block_processing_parameter.update(size_max=step * 30)
+    block_processing_parameter.update(size_max=step * 30)  # avoid hardcoded 30?
 
-    fill_block_p = functools.partial(fill_block, step=step, area_threshold=area_threshold, connectivity=connectivity)
+    fill_block_p = functools.partial(slice_fill_block,
+                                     step=step,
+                                     fill_ratio=fill_ratio,
+                                     connectivity=connectivity,
+                                     double_pass=double_pass,
+                                     area_threshold=area_threshold,
+                                     )
     fill_block_p.__name__ = 'slice filling'
     bp.process(fill_block_p, source, sink, **block_processing_parameter)
 
@@ -207,6 +236,73 @@ def slice_filling(source, sink=None, step=4, area_threshold=None, connectivity=2
         timer.print_elapsed_time('Binary slice filling: done')
 
     return sink
+
+
+# def fill_block(source, step, area_threshold, connectivity):
+#     # OPTIMIZATION: Consider cc3d implementation to speed up
+#     try:
+#         filled = source.array if isinstance(source, io.src.Source) else source
+#
+#         np.logical_not(filled, out=filled)
+#
+#         for block_axis in range(3):
+#             size = filled.shape[block_axis]
+#             slicer = [slice(None)] * filled.ndim
+#
+#             if area_threshold is None:
+#                 slice_shape = list(filled.shape)
+#                 slice_shape[block_axis] = step
+#                 slice_shape = sorted(slice_shape)
+#                 plane_size = slice_shape[-1] * slice_shape[-2]
+#                 axis_area_threshold = plane_size // 8  # TODO find something else than 8?
+#             else:
+#                 axis_area_threshold = area_threshold
+#
+#             for start in range(0, size, step):
+#                 slicer[block_axis] = slice(start, min(start + step, size))
+#                 slc = tuple(slicer)
+#                 filled[slc] = remove_small_objects(
+#                     filled[slc], max_size=axis_area_threshold, connectivity=connectivity
+#                 )
+#         np.logical_not(filled, out=filled)
+#         return filled
+#     except Exception as err:
+#         print(f"ERROR in fill")
+#         print(err, flush=True)
+#         raise
+#
+#
+# def slice_filling(source, sink=None, step=4, area_threshold=None, connectivity=2, processing_parameter=None,
+#                     processes=None, verbose=False):
+#     if verbose:
+#         print('Binary slice filling: initialization...')
+#         timer = tmr.Timer()
+#
+#     source = io.as_source(source)
+#     sink = io.initialize(sink, shape_=source.shape, dtype_=bool, order_=source.order)
+#     block_processing_parameter = dict(axes=bp.block_axes(source),
+#                                       as_memory=True,
+#                                       overlap=None,
+#                                       function_type='source',
+#                                       processes=processes,
+#                                       verbose=verbose)
+#
+#     if processing_parameter is not None:
+#         block_processing_parameter.update(processing_parameter)
+#     if block_processing_parameter.get('overlap') is None:
+#         block_processing_parameter.update({'overlap': 0})
+#     if block_processing_parameter.get('size_min') is None:
+#         block_processing_parameter.update(size_min=step * 10)
+#     block_processing_parameter.update(size_max=step * 30)
+#
+#     fill_block_p = functools.partial(fill_block, step=step, area_threshold=area_threshold, connectivity=connectivity)
+#     fill_block_p.__name__ = 'slice filling'
+#     bp.process(fill_block_p, source, sink, **block_processing_parameter)
+#
+#     if verbose:
+#         timer.print_elapsed_time('Binary slice filling: done')
+#
+#     return sink
 
 
 def _test():
