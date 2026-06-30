@@ -612,16 +612,18 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     parameter_snake = parameter.get('snake')
     if parameter_snake:
         parameter_snake, timer = print_params(parameter_snake, "Snake", prefix, verbose)
+        gamma_corrected = gamma_corrected.astype(np.uint16)
+        _mask = mask.astype(np.uint8)  # maybe delete old maks
 
-        snaked = snk.morphological_chan_vese(image=gamma_corrected.astype(np.uint16),
-                                             mask=mask.astype(np.uint8),
+        snaked = snk.morphological_chan_vese(image=gamma_corrected,
+                                             mask=_mask,
                                              **parameter_snake)
 
         snaked = snaked.astype(bool)
         post_snake = postprocess_snake(source=snaked, mask=not_low_mask)
         sink[valid_slicing] += post_snake[valid_slicing]
         timer.print_elapsed_time(r"Snake _/\_/\_o~")
-    del not_low_mask
+    del not_low_mask, _mask, snaked
     # active arrays: gamma_corrected, median, mask
 
     # adaptive
