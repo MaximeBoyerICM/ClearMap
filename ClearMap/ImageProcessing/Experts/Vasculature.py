@@ -95,7 +95,7 @@ default_binarization_parameter = dict(
                 save=None),
 
     # background removal
-    remove_bg=dict(sigma=13,
+    background_removal=dict(sigma=13,
                    sigma_mask=15),
 
     # deconvolution
