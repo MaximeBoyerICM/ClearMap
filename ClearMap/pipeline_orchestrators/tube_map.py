@@ -459,7 +459,7 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         if channel != self.all_vessels_channel:  # For arteries or veins
             # binarization_parameter.update(equalize=None, vesselize=None)
             binarization_parameter.update(lightsheet_correction=None,
-                                          gamma=None, snake=None,
+                                          gamma=None, adaptive=None,
                                           equalize=None, vesselize=None)
 
         else:
