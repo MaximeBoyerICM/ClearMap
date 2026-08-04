@@ -103,7 +103,7 @@ default_binarization_parameter = dict(
                     save=None),
 
      # gamma correction
-    gamma=dict(gamma=0.45),
+    gamma=dict(gamma=0.7),
 
     # snake
     snake=dict(lambda1=1.0,
