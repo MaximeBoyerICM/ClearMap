@@ -63,6 +63,14 @@ def binarize_modular(source, sink=None,
                                                   fn:,
                                                   sink_spec:}
         where fn is a top-level pickable BlockFunction (cf. StepFunction class for more details)
+
+        or, in a YAML file :
+        custom_steps:
+          step_name:
+            requires: [""]
+            produces: [""]
+            fn: fn_name
+
     """
     binarization_parameter = binarization_parameter or {}
     processing_parameter = processing_parameter or {}

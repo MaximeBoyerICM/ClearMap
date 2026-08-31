@@ -67,6 +67,27 @@ class SinkSpec:
     operator: Union[Callable[..., Any], np.ufunc] = field(default=np.logical_or)
     debug_label: Optional[int] = None
 
+    @classmethod
+    def from_dict(cls, data: Optional[Dict]) -> Optional['SinkSpec']:
+        """Construct SinkSpec from a dictionary, or return None if data is None."""
+        if data is None:
+            return None
+
+        operator = data.get('operator', cls.operator)  # Defaults to np.logical_or
+        if isinstance(operator, str):
+            if operator.startswith('np.'):
+                operator = getattr(np, operator[3:])  # Extract function from numpy
+            else:
+                raise ValueError(f"Unsupported operator: {operator}")
+
+        debug_label = data.get('debug_label')  # None if not provided
+
+        return cls(
+            result=data.get('result', cls.result),  # Defaults to 'result'
+            operator=operator,
+            debug_label=debug_label
+        )
+
 
 class StepFunction:
     """
@@ -296,8 +317,10 @@ class Registry:
                 fn = obj['fn']
                 fn = self._search_function_in_library(fn)
 
+                sink_spec = SinkSpec.from_dict(obj.get('sink_spec'))
+
                 self.step_functions[name] = StepFunction(fn=fn, requires=reqs, produces=prods,
-                                                         sink_spec=obj.get('sink_spec'),
+                                                         sink_spec=sink_spec,
                                                          dtypes=obj.get('dtypes', {}))
 
             elif isinstance(obj, StepFunction):
