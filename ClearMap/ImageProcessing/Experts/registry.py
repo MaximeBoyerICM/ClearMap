@@ -127,6 +127,20 @@ class StepFunction:
         return step_function(self.fn, self.requires, self.produces, self.sink_spec, self.step_name, data_ctx, tmp,
                              algo_params, self.dtypes)
 
+def convert_value(val, dt):
+    if isinstance(dt, str):
+        try:
+            dt = getattr(np, dt)
+        except AttributeError:
+            raise ValueError(f"Unknown NumPy dtype: {dt}")
+
+    if isinstance(dt, type) and not issubclass(dt, np.generic):
+        out = dt(val) if not isinstance(val, dt) else val
+    else:
+        out = np.asarray(val, dtype=dt)
+
+    return out
+
 
 def cast_to_dtypes(results, dtypes):
     """
@@ -146,21 +160,30 @@ def cast_to_dtypes(results, dtypes):
     dict
         Results with values cast to the specified dtypes.
     """
-    if dtypes:  # TODO maybe it should be mandatory to fill dtypes dict
-        out = {}
-        for key, val in results.items():
-            if key not in dtypes:
-                out[key] = val
-                print(f"Warning: no dtype was specified for {key}. No datatype cast will be performed.")  # TODO move to Logger object
-                continue
-            dt = dtypes[key]
-            if dt is str or isinstance(dt, type) and not issubclass(dt, np.generic):
-                out[key] = dt(val) if not isinstance(val, dt) else val
-            else:
-                out[key] = np.asarray(val, dtype=dt)
-        return out
-    else:
+    if not dtypes:  # TODO maybe make dtypes mandatory
         return results
+
+    out = {}
+    for key, val in results.items():
+        if key not in dtypes:
+            out[key] = val
+            print(f"Warning: no dtype was specified for {key}. No datatype cast will be performed.")  # TODO move to Logger object
+            continue
+
+        dt = dtypes[key]
+
+        if isinstance(dt, str):
+            try:
+                dt = getattr(np, dt)
+            except AttributeError:
+                raise ValueError(f"Unknown NumPy dtype: {dt}")
+
+        if isinstance(dt, type) and not issubclass(dt, np.generic):
+            out[key] = dt(val) if not isinstance(val, dt) else val
+        else:
+            out[key] = np.asarray(val, dtype=dt)
+
+    return out
 
 
 def step_function(fn: BlockFunction, requires: StepResource, produces: StepResource, sink_spec: SinkSpec | None, step_name: str,
@@ -228,7 +251,7 @@ DEFAULT_STEP_FUNCTIONS: Dict[str, StepFunction] = {
         'clip': StepFunction(fn=clip,
                              produces=['clipped', 'mask', 'high_mask', 'not_low_mask'],
                              sink_spec=SinkSpec("high_mask", np.logical_or),
-                             dtypes={'clipped': np.uint16, 'mask': np.bool_, 'high_mask': np.bool_, 'not_low_mask': np.bool_}),
+                             dtypes={'clipped': np.uint16, 'mask': np.int8, 'high_mask': np.int8, 'not_low_mask': np.int8}),
         'lightsheet': StepFunction(fn=lightsheet_correction,
                                    requires=['clipped', 'mask'],
                                    produces=['lc_corrected'],
