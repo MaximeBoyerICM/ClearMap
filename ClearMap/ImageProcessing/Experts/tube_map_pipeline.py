@@ -159,6 +159,7 @@ def _block_fn(_source, _sink, parameter):
 
     def _run(step_name: str):
         """Run a step. First check if required results are present."""
+        # TODO maybe do a dry-run first to ensure that the chain of requirements and products is valid
         try:
             step_fn = registry.step_functions[step_name]
 
@@ -181,16 +182,12 @@ def _block_fn(_source, _sink, parameter):
 
     # execute declared pipeline
     for name in pipeline:
-        try:
-            if name not in registry.step_functions:
-                raise KeyError(f'Unknown vasculature step "{name}".')
-            step_has_to_run = _validate_running_step(name)
-            if step_has_to_run:
-                _run(name)
-                _collect_garbage()
-        except Exception as e:  # TODO fix traceback not coming up without that
-            traceback.print_exc()
-            raise RuntimeError(f"Step '{name}' failed") from e
+        if name not in registry.step_functions:
+            raise KeyError(f'Unknown vasculature step "{name}".')
+        step_has_to_run = _validate_running_step(name)
+        if step_has_to_run:
+            _run(name)
+            _collect_garbage()
 
     return None  # block writes into sink
 
