@@ -99,6 +99,10 @@ def block_function(fn: ImageProcessingFunction) -> BlockFunction:
                     else:
                         operator = sink_spec.operator
                         data_ctx.sink[data_ctx.valid_slicing] = operator(result[data_ctx.valid_slicing], data_ctx.sink[data_ctx.valid_slicing])
+                else:
+                    print(f"Result '{result_to_sink}' cited in sink_spec not found in results of function {fn.__name__}."
+                          f"Cannot be written to disk."
+                          f"Available results: {list(results.keys())}") # TODO raise ?
         return results
 
     return wrapper
